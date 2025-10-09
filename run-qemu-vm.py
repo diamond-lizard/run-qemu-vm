@@ -131,8 +131,8 @@ def build_qemu_args(config):
     # Add display/graphics arguments based on firmware mode
     if config['firmware'] == 'bios':
         # Legacy BIOS on ARM often defaults to serial, so we disable graphics
-        # and connect the serial port to the terminal.
-        args.append("-nographic")
+        # and explicitly connect the serial port to the terminal.
+        args.extend(["-nographic", "-serial", "stdio"])
     else: # uefi
         # UEFI guests generally support modern graphical devices.
         args.extend([
@@ -209,7 +209,8 @@ def run_qemu(args):
         print(f"\nQEMU exited with an error (code {e.returncode}).", file=sys.stderr)
         sys.exit(e.returncode)
     except KeyboardInterrupt:
-        print("\n^C", file=sys.stderr)
+        # The Ctrl-A X sequence is the primary way to exit, but we handle Ctrl-C for completeness.
+        print("\nKeyboardInterrupt received. Exiting.", file=sys.stderr)
         sys.exit(130)
 
 def main():
