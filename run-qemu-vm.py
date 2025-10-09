@@ -23,7 +23,6 @@
 # Prerequisites:
 #   - QEMU must be installed (e.g., via `brew install qemu`).
 #   - The necessary disk image and ISO files must exist at the specified paths.
-#   - The script will create the UEFI variables file if it doesn't exist.
 #
 
 import argparse
@@ -53,8 +52,9 @@ MEMORY = "4G"
 SMP_CORES = 4
 # Path to the AArch64 UEFI firmware file. If None, it will be auto-detected.
 UEFI_CODE_PATH = None
-# Path to a file for storing UEFI variables (like boot order).
-UEFI_VARS_PATH = "qemu-vars.fd"
+# Path to a file for storing UEFI variables. If None, it defaults to being
+# located next to the disk image.
+UEFI_VARS_PATH = None
 # The virtual graphics card device. 'virtio-gpu-pci' is a standard, high-performance choice.
 GRAPHICS_DEVICE = "virtio-gpu-pci"
 # Configures the display window. 'default' creates a standard window, and 'show-cursor=on' makes the cursor visible.
@@ -115,11 +115,30 @@ def build_qemu_args(config):
 
 def prepare_uefi_vars_file(vars_path, code_path):
     """
-    Ensures the UEFI variables file exists and has the correct size.
-    If it doesn't exist, it's created by copying the UEFI code file.
+    Ensures the UEFI variables file is valid.
+    If it doesn't exist or has the wrong size, it's (re)created by copying
+    the UEFI code file. Otherwise, it's left untouched to preserve its state.
     """
+    should_create = False
+    try:
+        code_size = os.path.getsize(code_path)
+    except FileNotFoundError:
+        print(f"Error: UEFI code file not found at '{code_path}'", file=sys.stderr)
+        sys.exit(1)
+
     if not os.path.exists(vars_path):
-        print(f"Creating UEFI variables file by copying from UEFI code: {vars_path}")
+        print(f"UEFI variables file not found. Creating a new one at: {vars_path}")
+        should_create = True
+    else:
+        vars_size = os.path.getsize(vars_path)
+        if vars_size != code_size:
+            print(
+                f"Warning: UEFI variables file at '{vars_path}' has incorrect size "
+                f"({vars_size} bytes, expected {code_size} bytes). Recreating it."
+            )
+            should_create = True
+
+    if should_create:
         try:
             shutil.copyfile(code_path, vars_path)
         except IOError as e:
@@ -127,7 +146,7 @@ def prepare_uefi_vars_file(vars_path, code_path):
             sys.exit(1)
 
 def run_qemu(args):
-    """Executes the QEMU command with the provided arguments."""
+    """Executes the QEMU command and handles interrupts."""
     print("--- Starting QEMU with the following command ---")
     print(subprocess.list2cmdline(args))
     print("-------------------------------------------------")
@@ -141,9 +160,8 @@ def run_qemu(args):
         print(f"\nQEMU exited with an error (code {e.returncode}).", file=sys.stderr)
         sys.exit(e.returncode)
     except KeyboardInterrupt:
-        # Handle Ctrl-C gracefully
         print("\n^C", file=sys.stderr)
-        sys.exit(130) # Standard exit code for Ctrl-C
+        sys.exit(130)
 
 def main():
     """Parses command-line arguments and launches the VM."""
@@ -163,7 +181,7 @@ def main():
     parser.add_argument("--memory", default=MEMORY, help="RAM to allocate to the VM.")
     parser.add_argument("--smp-cores", type=int, default=SMP_CORES, help="Number of CPU cores for the VM.")
     parser.add_argument("--uefi-code", default=UEFI_CODE_PATH, help="Path to UEFI firmware code. (Default: auto-detected)")
-    parser.add_argument("--uefi-vars", default=UEFI_VARS_PATH, help="Path to UEFI variables file.")
+    parser.add_argument("--uefi-vars", default=UEFI_VARS_PATH, help="Path to UEFI variables file. Defaults to 'qemu-vars.fd' next to the disk image.")
     parser.add_argument("--graphics-device", default=GRAPHICS_DEVICE, help="Virtual graphics device.")
     parser.add_argument("--display-type", default=DISPLAY_TYPE, help="QEMU display configuration.")
     parser.add_argument("--usb-controller", default=USB_CONTROLLER, help="Virtual USB controller.")
@@ -182,20 +200,25 @@ def main():
     config = vars(args)
 
     # --- Post-processing and Validation ---
-    qemu_prefix = get_qemu_prefix(config['brew_executable'])
-    # Resolve UEFI code path if not provided
-    if not config["uefi_code"]:
-        config["uefi_code"] = str(qemu_prefix / "share/qemu/edk2-aarch64-code.fd")
-
-    # Ensure required files exist before attempting to launch
-    prepare_uefi_vars_file(config["uefi_vars"], config["uefi_code"])
-
     if not os.path.exists(config["disk_image"]):
         print(f"Error: Disk image not found at '{config['disk_image']}'", file=sys.stderr)
         sys.exit(1)
     if config["cdrom"] and not os.path.exists(config["cdrom"]):
         print(f"Error: CD-ROM ISO not found at '{config['cdrom']}'", file=sys.stderr)
         sys.exit(1)
+
+    qemu_prefix = get_qemu_prefix(config['brew_executable'])
+    # Resolve UEFI code path if not provided
+    if not config["uefi_code"]:
+        config["uefi_code"] = str(qemu_prefix / "share/qemu/edk2-aarch64-code.fd")
+
+    # Resolve UEFI vars path if not provided
+    if not config["uefi_vars"]:
+        disk_dir = Path(config["disk_image"]).parent
+        config["uefi_vars"] = str(disk_dir / "qemu-vars.fd")
+
+    # Ensure the UEFI variables file is valid before launching
+    prepare_uefi_vars_file(config["uefi_vars"], config["uefi_code"])
 
     qemu_args = build_qemu_args(config)
     run_qemu(qemu_args)
