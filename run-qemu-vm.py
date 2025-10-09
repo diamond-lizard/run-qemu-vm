@@ -123,7 +123,6 @@ def build_qemu_args(config):
         "-cpu", config["cpu_model"],
         "-m", config["memory"],
         "-smp", str(config["smp_cores"]),
-        "-device", config["graphics_device"],
         "-display", config["display_type"],
         "-device", config["usb_controller"],
         "-device", config["keyboard_device"],
@@ -132,6 +131,12 @@ def build_qemu_args(config):
         "-device", config["network_device"],
         "-hda", config["disk_image"],
     ]
+
+    # Add graphics device based on firmware mode
+    if config['firmware'] == 'bios':
+        args.extend(["-vga", "std"])
+    else: # uefi
+        args.extend(["-device", config["graphics_device"]])
 
     # Add firmware-specific arguments for UEFI mode
     if config['firmware'] == 'uefi':
@@ -232,7 +237,7 @@ def main():
     parser.add_argument("--smp-cores", type=int, default=SMP_CORES, help="Number of CPU cores for the VM.")
     parser.add_argument("--uefi-code", default=UEFI_CODE_PATH, help="Path to UEFI firmware code. (Default: auto-detected)")
     parser.add_argument("--uefi-vars", default=UEFI_VARS_PATH, help="Path to UEFI variables file. Defaults to a descriptive name next to the disk image.")
-    parser.add_argument("--graphics-device", default=GRAPHICS_DEVICE, help="Virtual graphics device. Auto-selected based on firmware if not specified.")
+    parser.add_argument("--graphics-device", default=GRAPHICS_DEVICE, help="Modern graphics device for UEFI mode (e.g., virtio-gpu-pci).")
     parser.add_argument("--display-type", default=DISPLAY_TYPE, help="QEMU display configuration.")
     parser.add_argument("--usb-controller", default=USB_CONTROLLER, help="Virtual USB controller.")
     parser.add_argument("--keyboard-device", default=KEYBOARD_DEVICE, help="Virtual keyboard device.")
@@ -260,12 +265,9 @@ def main():
     # Determine firmware mode: user override or auto-detect
     config['firmware'] = config.get('firmware') or detect_firmware_type(config.get('cdrom'))
 
-    # Set graphics device based on firmware mode if not explicitly set by user
-    if not config['graphics_device']:
-        if config['firmware'] == 'bios':
-            config['graphics_device'] = 'std' # Standard VGA for legacy BIOS
-        else:
-            config['graphics_device'] = 'virtio-gpu-pci' # High-performance virtio for UEFI
+    # Set graphics device for UEFI mode if not explicitly set by user
+    if config['firmware'] == 'uefi' and not config['graphics_device']:
+        config['graphics_device'] = 'virtio-gpu-pci'
 
     # If in UEFI mode, prepare the necessary files
     if config['firmware'] == 'uefi':
