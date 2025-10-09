@@ -41,8 +41,8 @@ BREW_EXECUTABLE = "brew"
 # The QEMU binary to execute.
 QEMU_EXECUTABLE = "qemu-system-aarch64"
 # The machine type to emulate. 'virt' is a modern, versatile virtual platform.
-# 'highmem=off' is required for the Hypervisor Framework on macOS.
-MACHINE_TYPE = "virt,highmem=off"
+# 'highmem=off,tcg-vmsplit=1' is used to avoid 32-bit addressing limits with HVF on macOS.
+MACHINE_TYPE = "virt,highmem=off,tcg-vmsplit=1"
 # The accelerator to use. 'hvf' enables macOS's native Hypervisor Framework for speed.
 ACCELERATOR = "hvf"
 # The CPU model to emulate. 'host' passes through the host CPU features for best performance.
