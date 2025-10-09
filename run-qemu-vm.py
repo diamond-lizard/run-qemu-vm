@@ -4,8 +4,8 @@
 # Description:
 #   This script launches a QEMU virtual machine to install or run an AArch64
 #   (ARM64) operating system from a provided ISO file. It intelligently
-#   selects the required firmware (UEFI or BIOS) based on the type of ISO
-#   provided, but allows for manual override.
+#   selects the required firmware (UEFI or BIOS) and a compatible graphics
+#   device based on the type of ISO provided.
 #
 # Usage:
 #   1. To start an OS installation from a modern UEFI ISO:
@@ -56,8 +56,8 @@ UEFI_CODE_PATH = None
 # Path to a file for storing UEFI variables. If None, it defaults to being
 # named after and located next to the disk image.
 UEFI_VARS_PATH = None
-# The virtual graphics card device. 'virtio-gpu-pci' is a standard, high-performance choice.
-GRAPHICS_DEVICE = "virtio-gpu-pci"
+# The virtual graphics card device. This is now determined dynamically.
+GRAPHICS_DEVICE = None
 # Configures the display window. 'default' creates a standard window, and 'show-cursor=on' makes the cursor visible.
 DISPLAY_TYPE = "default,show-cursor=on"
 # A virtual USB 3.0 (XHCI) controller.
@@ -232,7 +232,7 @@ def main():
     parser.add_argument("--smp-cores", type=int, default=SMP_CORES, help="Number of CPU cores for the VM.")
     parser.add_argument("--uefi-code", default=UEFI_CODE_PATH, help="Path to UEFI firmware code. (Default: auto-detected)")
     parser.add_argument("--uefi-vars", default=UEFI_VARS_PATH, help="Path to UEFI variables file. Defaults to a descriptive name next to the disk image.")
-    parser.add_argument("--graphics-device", default=GRAPHICS_DEVICE, help="Virtual graphics device.")
+    parser.add_argument("--graphics-device", default=GRAPHICS_DEVICE, help="Virtual graphics device. Auto-selected based on firmware if not specified.")
     parser.add_argument("--display-type", default=DISPLAY_TYPE, help="QEMU display configuration.")
     parser.add_argument("--usb-controller", default=USB_CONTROLLER, help="Virtual USB controller.")
     parser.add_argument("--keyboard-device", default=KEYBOARD_DEVICE, help="Virtual keyboard device.")
@@ -259,6 +259,13 @@ def main():
 
     # Determine firmware mode: user override or auto-detect
     config['firmware'] = config.get('firmware') or detect_firmware_type(config.get('cdrom'))
+
+    # Set graphics device based on firmware mode if not explicitly set by user
+    if not config['graphics_device']:
+        if config['firmware'] == 'bios':
+            config['graphics_device'] = 'std' # Standard VGA for legacy BIOS
+        else:
+            config['graphics_device'] = 'virtio-gpu-pci' # High-performance virtio for UEFI
 
     # If in UEFI mode, prepare the necessary files
     if config['firmware'] == 'uefi':
