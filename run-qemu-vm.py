@@ -4,17 +4,17 @@
 # Description:
 #   This script launches a QEMU virtual machine to install or run an AArch64
 #   (ARM64) operating system from a provided ISO file. It intelligently
-#   selects the required firmware (UEFI or BIOS) and a compatible graphics
-#   device based on the type of ISO provided.
+#   selects the required firmware (UEFI or BIOS) and a compatible display
+#   (graphical or serial console) based on the type of ISO provided.
 #
 # Usage:
-#   1. To start an OS installation from a modern UEFI ISO:
+#   1. To start an OS installation from a modern UEFI ISO (graphical):
 #      ./run-qemu-vm.py --disk-image my-os.qcow2 --cdrom uefi-installer.iso
 #
-#   2. To start an OS installation from a legacy BIOS ISO:
+#   2. To start an OS installation from a legacy BIOS ISO (serial console):
 #      ./run-qemu-vm.py --disk-image my-os.qcow2 --cdrom bios-installer.iso
 #
-#   3. To run an installed system (defaults to UEFI):
+#   3. To run an installed system (defaults to UEFI, graphical):
 #      ./run-qemu-vm.py --disk-image my-os.qcow2
 #
 #   4. To see all available options:
@@ -103,7 +103,7 @@ def detect_firmware_type(iso_path):
         )
         # If the file description contains "MBR boot sector", it's a legacy BIOS image.
         if 'MBR boot sector' in result.stdout:
-            print("Info: Legacy BIOS ISO detected. Switching to BIOS firmware mode.")
+            print("Info: Legacy BIOS ISO detected. Switching to BIOS firmware and serial console mode.")
             return 'bios'
         return 'uefi'
     except (FileNotFoundError, subprocess.CalledProcessError) as e:
@@ -123,15 +123,25 @@ def build_qemu_args(config):
         "-cpu", config["cpu_model"],
         "-m", config["memory"],
         "-smp", str(config["smp_cores"]),
-        "-device", config["graphics_device"],
-        "-display", config["display_type"],
-        "-device", config["usb_controller"],
-        "-device", config["keyboard_device"],
-        "-device", config["mouse_device"],
         "-netdev", config["network_backend"],
         "-device", config["network_device"],
         "-hda", config["disk_image"],
     ]
+
+    # Add display/graphics arguments based on firmware mode
+    if config['firmware'] == 'bios':
+        # Legacy BIOS on ARM often defaults to serial, so we disable graphics
+        # and connect the serial port to the terminal.
+        args.append("-nographic")
+    else: # uefi
+        # UEFI guests generally support modern graphical devices.
+        args.extend([
+            "-device", config["graphics_device"],
+            "-display", config["display_type"],
+            "-device", config["usb_controller"],
+            "-device", config["keyboard_device"],
+            "-device", config["mouse_device"],
+        ])
 
     # Add firmware-specific arguments for UEFI mode
     if config['firmware'] == 'uefi':
@@ -188,6 +198,7 @@ def run_qemu(args):
     print("--- Starting QEMU with the following command ---")
     print(subprocess.list2cmdline(args))
     print("-------------------------------------------------")
+    print(">>> QEMU output will be directed to this terminal. To exit, press Ctrl-A then X. <<<")
     try:
         subprocess.run(args, check=True)
     except FileNotFoundError:
@@ -260,12 +271,9 @@ def main():
     # Determine firmware mode: user override or auto-detect
     config['firmware'] = config.get('firmware') or detect_firmware_type(config.get('cdrom'))
 
-    # Set graphics device based on firmware mode if not explicitly set by user
-    if not config['graphics_device']:
-        if config['firmware'] == 'bios':
-            config['graphics_device'] = 'ramfb' # Basic framebuffer for legacy BIOS on ARM
-        else:
-            config['graphics_device'] = 'virtio-gpu-pci' # High-performance virtio for UEFI
+    # Set graphics device for UEFI mode if not explicitly set by user
+    if config['firmware'] == 'uefi' and not config['graphics_device']:
+        config['graphics_device'] = 'virtio-gpu-pci'
 
     # If in UEFI mode, prepare the necessary files
     if config['firmware'] == 'uefi':
