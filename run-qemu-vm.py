@@ -53,7 +53,7 @@ SMP_CORES = 4
 # Path to the AArch64 UEFI firmware file. If None, it will be auto-detected.
 UEFI_CODE_PATH = None
 # Path to a file for storing UEFI variables. If None, it defaults to being
-# located next to the disk image.
+# named after and located next to the disk image.
 UEFI_VARS_PATH = None
 # The virtual graphics card device. 'virtio-gpu-pci' is a standard, high-performance choice.
 GRAPHICS_DEVICE = "virtio-gpu-pci"
@@ -181,7 +181,7 @@ def main():
     parser.add_argument("--memory", default=MEMORY, help="RAM to allocate to the VM.")
     parser.add_argument("--smp-cores", type=int, default=SMP_CORES, help="Number of CPU cores for the VM.")
     parser.add_argument("--uefi-code", default=UEFI_CODE_PATH, help="Path to UEFI firmware code. (Default: auto-detected)")
-    parser.add_argument("--uefi-vars", default=UEFI_VARS_PATH, help="Path to UEFI variables file. Defaults to 'qemu-vars.fd' next to the disk image.")
+    parser.add_argument("--uefi-vars", default=UEFI_VARS_PATH, help="Path to UEFI variables file. Defaults to a descriptive name next to the disk image.")
     parser.add_argument("--graphics-device", default=GRAPHICS_DEVICE, help="Virtual graphics device.")
     parser.add_argument("--display-type", default=DISPLAY_TYPE, help="QEMU display configuration.")
     parser.add_argument("--usb-controller", default=USB_CONTROLLER, help="Virtual USB controller.")
@@ -212,10 +212,12 @@ def main():
     if not config["uefi_code"]:
         config["uefi_code"] = str(qemu_prefix / "share/qemu/edk2-aarch64-code.fd")
 
-    # Resolve UEFI vars path if not provided
+    # Resolve UEFI vars path if not provided by the user
     if not config["uefi_vars"]:
-        disk_dir = Path(config["disk_image"]).parent
-        config["uefi_vars"] = str(disk_dir / "qemu-vars.fd")
+        disk_path = Path(config["disk_image"])
+        disk_stem = disk_path.stem
+        vars_filename = f"{disk_stem}--persistent-variables.fd"
+        config["uefi_vars"] = str(disk_path.parent / vars_filename)
 
     # Ensure the UEFI variables file is valid before launching
     prepare_uefi_vars_file(config["uefi_vars"], config["uefi_code"])
