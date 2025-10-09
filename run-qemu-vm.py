@@ -30,6 +30,7 @@ import argparse
 import subprocess
 import sys
 import os
+import shutil
 from pathlib import Path
 
 # --- Global Configuration & Executable Paths ---
@@ -41,7 +42,6 @@ BREW_EXECUTABLE = "brew"
 # The QEMU binary to execute.
 QEMU_EXECUTABLE = "qemu-system-aarch64"
 # The machine type to emulate. 'virt' is a modern, versatile virtual platform.
-# 'highmem=off' is often not needed with modern QEMU and can cause memory address issues.
 MACHINE_TYPE = "virt"
 # The accelerator to use. 'hvf' enables macOS's native Hypervisor Framework for speed.
 ACCELERATOR = "hvf"
@@ -89,11 +89,6 @@ def get_qemu_prefix(brew_executable):
 
 def build_qemu_args(config):
     """Constructs the list of arguments for the QEMU command from the config."""
-    qemu_prefix = get_qemu_prefix(config['brew_executable'])
-
-    # Resolve the UEFI code path if it's not explicitly set
-    uefi_code_path = config["uefi_code"] or str(qemu_prefix / "share/qemu/edk2-aarch64-code.fd")
-
     args = [
         config["qemu_executable"],
         "-M", config["machine_type"],
@@ -101,7 +96,7 @@ def build_qemu_args(config):
         "-cpu", config["cpu_model"],
         "-m", config["memory"],
         "-smp", str(config["smp_cores"]),
-        "-drive", f"if=pflash,format=raw,readonly=on,file={uefi_code_path}",
+        "-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}",
         "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}",
         "-device", config["graphics_device"],
         "-display", config["display_type"],
@@ -118,11 +113,18 @@ def build_qemu_args(config):
 
     return args
 
-def create_uefi_vars_file(path):
-    """Creates an empty file for UEFI variables if it doesn't exist."""
-    if not os.path.exists(path):
-        print(f"Creating UEFI variables file: {path}")
-        Path(path).touch()
+def prepare_uefi_vars_file(vars_path, code_path):
+    """
+    Ensures the UEFI variables file exists and has the correct size.
+    If it doesn't exist, it's created by copying the UEFI code file.
+    """
+    if not os.path.exists(vars_path):
+        print(f"Creating UEFI variables file by copying from UEFI code: {vars_path}")
+        try:
+            shutil.copyfile(code_path, vars_path)
+        except IOError as e:
+            print(f"Error: Could not create UEFI variables file: {e}", file=sys.stderr)
+            sys.exit(1)
 
 def run_qemu(args):
     """Executes the QEMU command with the provided arguments."""
@@ -147,17 +149,10 @@ def main():
     )
 
     # --- Argument Definitions ---
-    # Required arguments
     parser.add_argument("--disk-image", required=True, help="Path to the primary virtual hard disk image (.qcow2).")
-
-    # Optional arguments with defaults from global variables
     parser.add_argument("--cdrom", help="Path to a bootable ISO file (for installation).")
-
-    # Executable paths
     parser.add_argument("--qemu-executable", default=QEMU_EXECUTABLE, help="Path to the QEMU binary.")
     parser.add_argument("--brew-executable", default=BREW_EXECUTABLE, help="Path to the Homebrew binary.")
-
-    # VM configuration
     parser.add_argument("--machine-type", default=MACHINE_TYPE, help="QEMU machine type.")
     parser.add_argument("--accelerator", default=ACCELERATOR, help="VM accelerator to use.")
     parser.add_argument("--cpu-model", default=CPU_MODEL, help="CPU model to emulate.")
@@ -180,11 +175,17 @@ def main():
         print(str(e), file=sys.stderr)
         sys.exit(1)
 
-    # Convert parsed arguments to a dictionary for easier handling
     config = vars(args)
 
+    # --- Post-processing and Validation ---
+    qemu_prefix = get_qemu_prefix(config['brew_executable'])
+    # Resolve UEFI code path if not provided
+    if not config["uefi_code"]:
+        config["uefi_code"] = str(qemu_prefix / "share/qemu/edk2-aarch64-code.fd")
+
     # Ensure required files exist before attempting to launch
-    create_uefi_vars_file(config["uefi_vars"])
+    prepare_uefi_vars_file(config["uefi_vars"], config["uefi_code"])
+
     if not os.path.exists(config["disk_image"]):
         print(f"Error: Disk image not found at '{config['disk_image']}'", file=sys.stderr)
         sys.exit(1)
