@@ -3,25 +3,26 @@
 #
 # Description:
 #   This script launches a QEMU virtual machine to install or run an AArch64
-#   (ARM64) operating system from a provided ISO file.
-#
-#   It automates the process of constructing the complex qemu-system-aarch64
-#   command by defining each argument as a configurable variable. All settings,
-#   such as memory, CPU cores, disk images, and firmware paths, can be
-#   overridden using command-line flags.
+#   (ARM64) operating system from a provided ISO file. It intelligently
+#   selects the required firmware (UEFI or BIOS) based on the type of ISO
+#   provided, but allows for manual override.
 #
 # Usage:
-#   1. To start an OS installation from an ISO:
-#      ./run-qemu-vm.py --disk-image my-os.qcow2 --cdrom path/to/installer.iso
+#   1. To start an OS installation from a modern UEFI ISO:
+#      ./run-qemu-vm.py --disk-image my-os.qcow2 --cdrom uefi-installer.iso
 #
-#   2. To run the installed system (without the CD-ROM):
+#   2. To start an OS installation from a legacy BIOS ISO:
+#      ./run-qemu-vm.py --disk-image my-os.qcow2 --cdrom bios-installer.iso
+#
+#   3. To run an installed system (defaults to UEFI):
 #      ./run-qemu-vm.py --disk-image my-os.qcow2
 #
-#   3. To see all available options:
+#   4. To see all available options:
 #      ./run-qemu-vm.py --help
 #
 # Prerequisites:
 #   - QEMU must be installed (e.g., via `brew install qemu`).
+#   - The `file` command-line utility must be available.
 #   - The necessary disk image and ISO files must exist at the specified paths.
 #
 
@@ -79,13 +80,39 @@ def get_qemu_prefix(brew_executable):
             stderr=subprocess.PIPE
         ).strip()
         return Path(prefix)
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(
             f"Error: Could not find QEMU prefix using '{brew_executable}'. "
-            "Is Homebrew installed and is the executable path correct?",
+            f"Is Homebrew installed and in your PATH? Error: {e}",
             file=sys.stderr
         )
         sys.exit(1)
+
+def detect_firmware_type(iso_path):
+    """
+    Detects the required firmware type (bios or uefi) for a given ISO.
+    Defaults to 'uefi' if no ISO is provided or if detection fails.
+    """
+    if not iso_path:
+        return 'uefi'
+
+    try:
+        result = subprocess.run(
+            ['file', '--brief', iso_path],
+            capture_output=True, text=True, check=True
+        )
+        # If the file description contains "MBR boot sector", it's a legacy BIOS image.
+        if 'MBR boot sector' in result.stdout:
+            print("Info: Legacy BIOS ISO detected. Switching to BIOS firmware mode.")
+            return 'bios'
+        return 'uefi'
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        print(
+            f"Warning: Could not run 'file' command to detect ISO type (Error: {e}). "
+            "Defaulting to UEFI firmware. Use --firmware if this is incorrect.",
+            file=sys.stderr
+        )
+        return 'uefi'
 
 def build_qemu_args(config):
     """Constructs the list of arguments for the QEMU command from the config."""
@@ -96,8 +123,6 @@ def build_qemu_args(config):
         "-cpu", config["cpu_model"],
         "-m", config["memory"],
         "-smp", str(config["smp_cores"]),
-        "-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}",
-        "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}",
         "-device", config["graphics_device"],
         "-display", config["display_type"],
         "-device", config["usb_controller"],
@@ -108,23 +133,21 @@ def build_qemu_args(config):
         "-hda", config["disk_image"],
     ]
 
+    # Add firmware-specific arguments for UEFI mode
+    if config['firmware'] == 'uefi':
+        args.extend([
+            "-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}",
+            "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}",
+        ])
+
     # Add CD-ROM if specified
     if config["cdrom"]:
         args.extend(["-cdrom", config["cdrom"]])
 
     # Determine boot order based on user input or defaults
-    boot_device = config.get("boot_from")
-    if not boot_device:
-        # If no explicit boot order, default to CD-ROM if it's present
-        if config["cdrom"]:
-            boot_device = "cdrom"
-        else:
-            boot_device = "hd"
-
-    if boot_device == "cdrom":
-        args.extend(["-boot", "order=d"])
-    elif boot_device == "hd":
-        args.extend(["-boot", "order=c"])
+    boot_device = config.get("boot_from") or ('cdrom' if config["cdrom"] else 'hd')
+    boot_order = 'd' if boot_device == 'cdrom' else 'c'
+    args.extend(["-boot", f"order={boot_order}"])
 
     return args
 
@@ -188,11 +211,13 @@ def main():
     # --- Argument Definitions ---
     parser.add_argument("--disk-image", required=True, help="Path to the primary virtual hard disk image (.qcow2).")
     parser.add_argument("--cdrom", help="Path to a bootable ISO file (for installation).")
-    # New argument to control boot order
     parser.add_argument(
-        "--boot-from",
-        choices=['cdrom', 'hd'],
+        "--boot-from", choices=['cdrom', 'hd'],
         help="Specify the boot device. If --cdrom is used, the default is 'cdrom'. Otherwise, the default is 'hd'."
+    )
+    parser.add_argument(
+        "--firmware", choices=['uefi', 'bios'],
+        help="Specify firmware mode. If not provided, it's auto-detected based on the CD-ROM, defaulting to 'uefi'."
     )
 
     # Executable paths
@@ -232,20 +257,25 @@ def main():
         print(f"Error: CD-ROM ISO not found at '{config['cdrom']}'", file=sys.stderr)
         sys.exit(1)
 
-    qemu_prefix = get_qemu_prefix(config['brew_executable'])
-    # Resolve UEFI code path if not provided
-    if not config["uefi_code"]:
-        config["uefi_code"] = str(qemu_prefix / "share/qemu/edk2-aarch64-code.fd")
+    # Determine firmware mode: user override or auto-detect
+    config['firmware'] = config.get('firmware') or detect_firmware_type(config.get('cdrom'))
 
-    # Resolve UEFI vars path if not provided by the user
-    if not config["uefi_vars"]:
-        disk_path = Path(config["disk_image"])
-        disk_stem = disk_path.stem
-        vars_filename = f"{disk_stem}--persistent-variables.fd"
-        config["uefi_vars"] = str(disk_path.parent / vars_filename)
+    # If in UEFI mode, prepare the necessary files
+    if config['firmware'] == 'uefi':
+        qemu_prefix = get_qemu_prefix(config['brew_executable'])
+        # Resolve UEFI code path if not provided
+        if not config["uefi_code"]:
+            config["uefi_code"] = str(qemu_prefix / "share/qemu/edk2-aarch64-code.fd")
 
-    # Ensure the UEFI variables file is valid before launching
-    prepare_uefi_vars_file(config["uefi_vars"], config["uefi_code"])
+        # Resolve UEFI vars path if not provided by the user
+        if not config["uefi_vars"]:
+            disk_path = Path(config["disk_image"])
+            disk_stem = disk_path.stem
+            vars_filename = f"{disk_stem}--persistent-variables.fd"
+            config["uefi_vars"] = str(disk_path.parent / vars_filename)
+
+        # Ensure the UEFI variables file is valid before launching
+        prepare_uefi_vars_file(config["uefi_vars"], config["uefi_code"])
 
     qemu_args = build_qemu_args(config)
     run_qemu(qemu_args)
