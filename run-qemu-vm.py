@@ -134,12 +134,16 @@ def run_qemu(args):
     try:
         subprocess.run(args, check=True)
     except FileNotFoundError:
-        print(f"Error: Command not found: {args[0]}", file=sys.stderr)
+        print(f"\nError: Command not found: {args[0]}", file=sys.stderr)
         print("Please ensure QEMU is installed and the executable path is correct.", file=sys.stderr)
         sys.exit(1)
     except subprocess.CalledProcessError as e:
-        print(f"QEMU exited with an error (code {e.returncode}).", file=sys.stderr)
+        print(f"\nQEMU exited with an error (code {e.returncode}).", file=sys.stderr)
         sys.exit(e.returncode)
+    except KeyboardInterrupt:
+        # Handle Ctrl-C gracefully
+        print("\n^C", file=sys.stderr)
+        sys.exit(130) # Standard exit code for Ctrl-C
 
 def main():
     """Parses command-line arguments and launches the VM."""
