@@ -130,9 +130,10 @@ def build_qemu_args(config):
 
     # Add display/graphics arguments based on firmware mode
     if config['firmware'] == 'bios':
-        # Legacy BIOS on ARM often defaults to serial, so we disable graphics
-        # and explicitly connect the serial port to the terminal.
-        args.extend(["-nographic", "-serial", "stdio"])
+        # Legacy BIOS on ARM often defaults to serial. We disable graphics,
+        # redirect the monitor to a null device to prevent conflict, and
+        # explicitly connect the serial port to the terminal.
+        args.extend(["-nographic", "-monitor", "null", "-serial", "stdio"])
     else: # uefi
         # UEFI guests generally support modern graphical devices.
         args.extend([
