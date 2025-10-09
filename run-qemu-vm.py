@@ -108,8 +108,23 @@ def build_qemu_args(config):
         "-hda", config["disk_image"],
     ]
 
+    # Add CD-ROM if specified
     if config["cdrom"]:
         args.extend(["-cdrom", config["cdrom"]])
+
+    # Determine boot order based on user input or defaults
+    boot_device = config.get("boot_from")
+    if not boot_device:
+        # If no explicit boot order, default to CD-ROM if it's present
+        if config["cdrom"]:
+            boot_device = "cdrom"
+        else:
+            boot_device = "hd"
+
+    if boot_device == "cdrom":
+        args.extend(["-boot", "order=d"])
+    elif boot_device == "hd":
+        args.extend(["-boot", "order=c"])
 
     return args
 
@@ -173,8 +188,18 @@ def main():
     # --- Argument Definitions ---
     parser.add_argument("--disk-image", required=True, help="Path to the primary virtual hard disk image (.qcow2).")
     parser.add_argument("--cdrom", help="Path to a bootable ISO file (for installation).")
+    # New argument to control boot order
+    parser.add_argument(
+        "--boot-from",
+        choices=['cdrom', 'hd'],
+        help="Specify the boot device. If --cdrom is used, the default is 'cdrom'. Otherwise, the default is 'hd'."
+    )
+
+    # Executable paths
     parser.add_argument("--qemu-executable", default=QEMU_EXECUTABLE, help="Path to the QEMU binary.")
     parser.add_argument("--brew-executable", default=BREW_EXECUTABLE, help="Path to the Homebrew binary.")
+
+    # VM configuration
     parser.add_argument("--machine-type", default=MACHINE_TYPE, help="QEMU machine type.")
     parser.add_argument("--accelerator", default=ACCELERATOR, help="VM accelerator to use.")
     parser.add_argument("--cpu-model", default=CPU_MODEL, help="CPU model to emulate.")
