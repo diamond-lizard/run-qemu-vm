@@ -191,6 +191,9 @@ def build_qemu_args(config):
         "-netdev", config["network_backend"],
         "-device", config["network_device"],
         "-hda", config["disk_image"],
+        # Add USB controller unconditionally, as it's needed for boot automation
+        # and does not require a GUI.
+        "-device", config["usb_controller"],
     ]
 
     if config["cdrom"]:
@@ -205,7 +208,7 @@ def build_qemu_args(config):
         args.extend([
             "-device", config["graphics_device"],
             "-display", config["display_type"],
-            "-device", config["usb_controller"],
+            # Add input devices only for GUI mode.
             "-device", config["keyboard_device"],
             "-device", config["mouse_device"],
         ])
