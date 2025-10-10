@@ -134,6 +134,43 @@ VIRTFS_SECURITY_MODEL = "mapped-xattr"
 # Alternative: "9p2000.u" for older systems.
 VIRTFS_VERSION = "9p2000.L"
 
+# Valid character pattern for VirtFS mount tags.
+# Mount tags are identifiers used by QEMU and the 9P protocol to reference
+# shared filesystems. They must be simple identifiers without special characters
+# that could be misinterpreted by shells, filesystems, or QEMU itself.
+#
+# Pattern breakdown: ^[a-zA-Z0-9_]+$
+#   ^        - Start of string (no leading characters allowed)
+#   [...]    - Character class (only these characters allowed)
+#   a-z      - Lowercase letters
+#   A-Z      - Uppercase letters
+#   0-9      - Digits
+#   _        - Underscore ONLY (hyphens are NOT allowed)
+#   +        - One or more characters (empty tags not allowed)
+#   $        - End of string (no trailing characters allowed)
+#
+# Why these restrictions?
+#   1. Mount tags are used as identifiers in QEMU command-line arguments
+#   2. They become filesystem mount points in the 9P protocol
+#   3. They are used as device IDs in QEMU's internal device tree
+#   4. Hyphens could be confused with command-line flags (--mount-tag)
+#   5. Spaces would break shell argument parsing
+#   6. Special characters might have meaning in filesystem contexts
+#   7. Unicode characters could cause encoding issues
+#
+# Examples of VALID mount tags:
+#   hostshare, myfiles, shared_data, project123, MY_DOCS
+#
+# Examples of INVALID mount tags:
+#   shared-dir (contains hyphen)
+#   my files (contains space)
+#   data! (contains exclamation mark)
+#   café (contains non-ASCII character)
+MOUNT_TAG_PATTERN = r'^[a-zA-Z0-9_]+$'
+
+# Human-readable description of allowed characters for error messages.
+MOUNT_TAG_ALLOWED_CHARS = "letters (a-z, A-Z), numbers (0-9), and underscores (_)"
+
 # --- Text Console Mode Constants ---
 MODE_SERIAL_CONSOLE = 'serial_console'
 MODE_CONTROL_MENU = 'control_menu'
@@ -211,16 +248,32 @@ def parse_share_dir_argument(share_dir_arg):
 
     Format: /host/path:mount_tag
 
+    Performs comprehensive validation:
+      - Checks format has exactly one colon separator
+      - Validates host path exists and is a directory
+      - Validates mount tag contains only allowed characters
+      - Provides detailed, actionable error messages with visual indicators
+
     Returns: (host_path, mount_tag) or (None, None) if invalid
     """
     if not share_dir_arg:
         return None, None
 
+    # Check for colon separator
     if ':' not in share_dir_arg:
         print(f"Error: --share-dir format must be '/host/path:mount_tag'", file=sys.stderr)
-        print(f"Example: --share-dir /Users/myuser/projects:hostshare", file=sys.stderr)
+        print(f"       Missing colon (:) separator", file=sys.stderr)
+        print(f"", file=sys.stderr)
+        print(f"       You provided: {share_dir_arg}", file=sys.stderr)
+        print(f"       Expected format: /path/to/directory:mount_tag", file=sys.stderr)
+        print(f"", file=sys.stderr)
+        print(f"       Examples:", file=sys.stderr)
+        print(f"         --share-dir /Users/myuser/projects:myprojects", file=sys.stderr)
+        print(f"         --share-dir ~/Documents:docs", file=sys.stderr)
+        print(f"         --share-dir /tmp/shared:shared_data", file=sys.stderr)
         return None, None
 
+    # Split on last colon to handle paths with colons (rare but possible)
     parts = share_dir_arg.rsplit(':', 1)
     if len(parts) != 2:
         print(f"Error: Invalid --share-dir format: {share_dir_arg}", file=sys.stderr)
@@ -231,16 +284,107 @@ def parse_share_dir_argument(share_dir_arg):
     # Validate host path exists
     if not os.path.exists(host_path):
         print(f"Error: Host directory does not exist: {host_path}", file=sys.stderr)
+        print(f"", file=sys.stderr)
+        print(f"       Please create the directory first:", file=sys.stderr)
+        print(f"         mkdir -p {host_path}", file=sys.stderr)
         return None, None
 
     if not os.path.isdir(host_path):
         print(f"Error: Host path is not a directory: {host_path}", file=sys.stderr)
+        print(f"", file=sys.stderr)
+        print(f"       The path exists but is a file, not a directory.", file=sys.stderr)
+        print(f"       Please specify a directory to share.", file=sys.stderr)
         return None, None
 
-    # Validate mount tag (alphanumeric and underscore only)
-    if not re.match(r'^[a-zA-Z0-9_]+$', mount_tag):
-        print(f"Error: Mount tag must be alphanumeric: {mount_tag}", file=sys.stderr)
-        print(f"Valid examples: hostshare, myfiles, shared_docs", file=sys.stderr)
+    # Validate mount tag - find ALL invalid characters and their positions
+    invalid_chars = []
+    for i, char in enumerate(mount_tag):
+        if not re.match(r'[a-zA-Z0-9_]', char):
+            invalid_chars.append((i, char))
+
+    if invalid_chars:
+        # Build detailed error message with visual indicators
+        print(f"Error: Invalid characters in mount tag '{mount_tag}'", file=sys.stderr)
+        print(f"       {mount_tag}", file=sys.stderr)
+
+        # Create a line with carets pointing to invalid characters
+        caret_line = [' '] * len(mount_tag)
+        for pos, char in invalid_chars:
+            caret_line[pos] = '^'
+        print(f"       {''.join(caret_line)}", file=sys.stderr)
+
+        # List each invalid character with its position and description
+        for pos, char in invalid_chars:
+            char_name = {
+                ' ': 'space',
+                '-': 'hyphen',
+                '.': 'period',
+                '/': 'forward slash',
+                '\\': 'backslash',
+                '!': 'exclamation mark',
+                '@': 'at sign',
+                '#': 'hash',
+                '$': 'dollar sign',
+                '%': 'percent',
+                '^': 'caret',
+                '&': 'ampersand',
+                '*': 'asterisk',
+                '(': 'left parenthesis',
+                ')': 'right parenthesis',
+                '+': 'plus sign',
+                '=': 'equals sign',
+                '[': 'left bracket',
+                ']': 'right bracket',
+                '{': 'left brace',
+                '}': 'right brace',
+                '|': 'pipe',
+                ';': 'semicolon',
+                ':': 'colon',
+                "'": 'single quote',
+                '"': 'double quote',
+                '<': 'less than',
+                '>': 'greater than',
+                ',': 'comma',
+                '?': 'question mark',
+                '~': 'tilde',
+                '`': 'backtick'
+            }.get(char, 'special character')
+
+            print(f"       Position {pos + 1}: '{char}' ({char_name}) is not allowed", file=sys.stderr)
+
+        print(f"", file=sys.stderr)
+        print(f"       Mount tags may only contain:", file=sys.stderr)
+        print(f"         • Letters: a-z, A-Z", file=sys.stderr)
+        print(f"         • Numbers: 0-9", file=sys.stderr)
+        print(f"         • Underscores: _", file=sys.stderr)
+        print(f"", file=sys.stderr)
+        print(f"       Hyphens (-), spaces, and special characters are NOT allowed.", file=sys.stderr)
+        print(f"", file=sys.stderr)
+
+        # Suggest a corrected version
+        suggested = mount_tag
+        # Replace common problematic characters with underscores
+        for char in ['-', ' ', '.', '/', '\\']:
+            suggested = suggested.replace(char, '_')
+        # Remove any remaining invalid characters
+        suggested = re.sub(r'[^a-zA-Z0-9_]', '', suggested)
+        # Collapse multiple underscores
+        suggested = re.sub(r'_+', '_', suggested)
+        # Remove leading/trailing underscores
+        suggested = suggested.strip('_')
+
+        if suggested and suggested != mount_tag:
+            print(f"       Suggested fix: {suggested}", file=sys.stderr)
+            print(f"       Use: --share-dir {host_path}:{suggested}", file=sys.stderr)
+        else:
+            print(f"       Valid examples: hostshare, myfiles, shared_data", file=sys.stderr)
+
+        return None, None
+
+    # Validate mount tag is not empty (edge case after split)
+    if not mount_tag:
+        print(f"Error: Mount tag cannot be empty", file=sys.stderr)
+        print(f"       Format: /host/path:mount_tag", file=sys.stderr)
         return None, None
 
     # Convert to absolute path
@@ -766,19 +910,29 @@ def main():
     """Parses command-line arguments and launches the VM."""
     parser = argparse.ArgumentParser(
         description="Launch a QEMU AArch64 virtual machine with fully independent display and firmware options.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Directory Sharing:
+Directory Sharing (VirtFS):
   Use --share-dir to share a host directory with the guest via VirtFS (9P).
 
-  Example: --share-dir /Users/myuser/projects:hostshare
+  Format: /host/path:mount_tag
+
+  Mount tag restrictions (IMPORTANT):
+    • Must contain ONLY: letters (a-z, A-Z), numbers (0-9), underscores (_)
+    • Hyphens (-), spaces, and special characters are NOT allowed
+    • Cannot be empty
+
+  Examples:
+    --share-dir /Users/myuser/projects:myprojects
+    --share-dir ~/Documents:docs
+    --share-dir /tmp/data:shared_data
 
   Inside the guest, mount with:
-    sudo mkdir -p /mnt/hostshare
-    sudo mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/hostshare
+    sudo mkdir -p /mnt/myprojects
+    sudo mount -t 9p -o trans=virtio,version=9p2000.L myprojects /mnt/myprojects
 
   To make it persistent, add to /etc/fstab in the guest:
-    hostshare  /mnt/hostshare  9p  trans=virtio,version=9p2000.L,_netdev  0  0
+    myprojects  /mnt/myprojects  9p  trans=virtio,version=9p2000.L,_netdev  0  0
 
   Note: Guest kernel must have 9P filesystem support (CONFIG_9P_FS).
         """
@@ -801,8 +955,11 @@ Directory Sharing:
     )
     parser.add_argument(
         "--share-dir",
-        help="Share a host directory with the guest. Format: /host/path:mount_tag (e.g., /Users/me/data:hostshare). "
-             "Mount in guest with: sudo mount -t 9p -o trans=virtio mount_tag /mnt/mountpoint"
+        metavar="/HOST/PATH:MOUNT_TAG",
+        help="Share a host directory with the guest via VirtFS. "
+             "Format: /host/path:mount_tag (e.g., /Users/me/data:mydata). "
+             "Mount tag must contain only letters, numbers, and underscores (NO hyphens or spaces). "
+             "Mount in guest: sudo mount -t 9p -o trans=virtio mount_tag /mnt/mountpoint"
     )
 
     # Executable paths
