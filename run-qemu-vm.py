@@ -215,11 +215,11 @@ def build_qemu_args(config):
     else: # text console
         print("Info: Using text-only (serial) console.")
         args.extend([
-            "-nographic",
-            "-monitor", "null",
-            # Use mon:stdio to enable QEMU's terminal emulation,
-            # which fixes key mapping issues for backspace and arrow keys.
-            "-serial", "mon:stdio",
+            # -display curses provides a text-based console that correctly
+            # handles special keys (arrows, backspace) and allows Ctrl-C to work.
+            # It replaces -nographic.
+            "-display", "curses",
+            "-serial", "stdio",
         ])
 
     # --- Firmware-Specific Configuration ---
@@ -313,8 +313,8 @@ def run_qemu(args):
     print("--- Starting QEMU with the following command ---")
     print(subprocess.list2cmdline(args))
     print("-------------------------------------------------")
-    if "-nographic" in args:
-        print(">>> QEMU output will be directed to this terminal. To exit, press Ctrl-A then X. <<<")
+    if "curses" in args:
+        print(">>> QEMU using curses display. To exit, press Ctrl-C. <<<")
     try:
         process = subprocess.Popen(args)
         process.wait()
