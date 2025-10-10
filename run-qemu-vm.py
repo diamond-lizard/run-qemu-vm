@@ -367,7 +367,7 @@ def main():
     parser.add_argument("--uefi-vars", default=UEFI_VARS_PATH, help="Path to UEFI variables file. Defaults to a descriptive name next to the disk image.")
     parser.add_argument("--graphics-device", default=GRAPHICS_DEVICE, help="Virtual graphics device. Auto-selected based on firmware if not specified.")
     parser.add_argument("--display-type", default=DISPLAY_TYPE, help="QEMU display configuration.")
-    parser.add_action("--usb-controller", default=USB_CONTROLLER, help="Virtual USB controller.")
+    parser.add_argument("--usb-controller", default=USB_CONTROLLER, help="Virtual USB controller.")
     parser.add_argument("--keyboard-device", default=KEYBOARD_DEVICE, help="Virtual keyboard device.")
     parser.add_argument("--mouse-device", default=MOUSE_DEVICE, help="Virtual mouse/tablet device.")
     parser.add_argument("--network-backend", default=NETWORK_BACKEND, help="Network backend configuration.")
