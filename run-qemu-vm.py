@@ -40,43 +40,40 @@ from pathlib import Path
 import re
 
 # --- Global Configuration & Executable Paths ---
-# These variables define the default settings for the VM and can be overridden
-# by command-line arguments.
 
-# Path to the Homebrew executable.
+# The command for the Homebrew package manager, used to auto-locate QEMU files.
 BREW_EXECUTABLE = "brew"
-# The QEMU binary to execute.
+# The specific QEMU binary for emulating a 64-bit ARM system.
 QEMU_EXECUTABLE = "qemu-system-aarch64"
-# The 7-Zip binary to execute for extracting files from ISOs.
+# The command for the 7-Zip archive tool, used to extract kernel/initrd from ISOs.
 SEVEN_ZIP_EXECUTABLE = "7z"
-# The machine type to emulate. 'virt' is a modern, versatile virtual platform.
+# The virtual machine type QEMU will emulate; 'virt' is the modern standard for ARM.
 MACHINE_TYPE = "virt"
-# The accelerator to use. 'hvf' enables macOS's native Hypervisor Framework for speed.
+# The hardware virtualization framework to use; 'hvf' is native to macOS on ARM.
 ACCELERATOR = "hvf"
-# The CPU model to emulate. 'host' passes through the host CPU features for best performance.
+# The CPU model to emulate; 'host' passes through the host CPU features for best performance.
 CPU_MODEL = "host"
-# The amount of RAM to allocate to the virtual machine (e.g., '4G', '8192M').
+# The default amount of RAM to allocate to the virtual machine.
 MEMORY = "4G"
-# The number of CPU cores to assign to the VM.
+# The default number of virtual CPU cores for the guest system.
 SMP_CORES = 4
-# Path to the AArch64 UEFI firmware file. If None, it will be auto-detected.
+# The path to the UEFI firmware code file; auto-detected if not specified.
 UEFI_CODE_PATH = None
-# Path to a file for storing UEFI variables. If None, it defaults to being
-# named after and located next to the disk image.
+# The path to the UEFI variables file, for persistent settings; auto-generated if not specified.
 UEFI_VARS_PATH = None
-# The virtual graphics card device. This is now determined dynamically.
+# The virtual graphics device to use in GUI mode; auto-selected if not specified.
 GRAPHICS_DEVICE = None
-# Configures the display window. 'default' creates a standard window, and 'show-cursor=on' makes the cursor visible.
+# The QEMU display configuration string for GUI mode.
 DISPLAY_TYPE = "default,show-cursor=on"
-# A virtual USB 3.0 (XHCI) controller.
+# The virtual USB controller model.
 USB_CONTROLLER = "qemu-xhci"
-# A virtual USB keyboard, providing standard keyboard input.
+# The virtual keyboard device to attach in GUI mode.
 KEYBOARD_DEVICE = "usb-kbd"
-# A virtual USB tablet device, providing more accurate mouse pointer tracking.
+# The virtual mouse/tablet device to attach in GUI mode for accurate cursor tracking.
 MOUSE_DEVICE = "usb-tablet"
-# Defines a user-mode network backend for internet access.
+# The network backend configuration for user-mode networking.
 NETWORK_BACKEND = "user,id=net0"
-# Defines the virtual network interface card (NIC) for the VM.
+# The virtual network interface card (NIC) device attached to the guest.
 NETWORK_DEVICE = "virtio-net-pci,netdev=net0"
 
 def get_qemu_prefix(brew_executable):
@@ -213,15 +210,12 @@ def build_qemu_args(config):
             "-device", config["mouse_device"],
         ])
     else: # text console
-        print("Info: Using text-only (serial) console.")
+        print("Info: Using text-only (serial) console via pseudo-terminal (pty).")
         args.extend([
             "-nographic",
-            # This combination provides a multiplexed stdio character device
-            # that correctly handles terminal key escape codes without
-            # capturing Ctrl-C.
-            "-chardev", "stdio,id=char0,mux=on",
+            # This creates a pseudo-terminal on the host. QEMU will print its path.
+            "-chardev", "pty,id=char0",
             "-serial", "chardev:char0",
-            "-mon", "chardev=char0",
         ])
 
     # --- Firmware-Specific Configuration ---
@@ -282,7 +276,6 @@ def prepare_uefi_vars_file(vars_path, code_path):
     """
     Ensures the UEFI variables file is valid.
     """
-    # ... (function is unchanged) ...
     should_create = False
     try:
         code_size = os.path.getsize(code_path)
@@ -315,17 +308,12 @@ def run_qemu(args):
     print("--- Starting QEMU with the following command ---")
     print(subprocess.list2cmdline(args))
     print("-------------------------------------------------")
-    # Check for the multiplexed chardev setup
-    if "-chardev" in " ".join(args):
-        print(">>> QEMU using multiplexed serial console. To exit, press Ctrl-A then X. <<<")
     try:
         process = subprocess.Popen(args)
         process.wait()
     except FileNotFoundError:
-        # ... (error handling as before) ...
         sys.exit(1)
     except KeyboardInterrupt:
-        # ... (interrupt handling as before) ...
         sys.exit(130)
 
     if 'process' in locals() and process.returncode != 0:
@@ -381,10 +369,8 @@ def main():
 
     # --- Post-processing and Validation ---
     if not os.path.exists(config["disk_image"]):
-        # ... (error handling as before) ...
         sys.exit(1)
     if config["cdrom"] and not os.path.exists(config["cdrom"]):
-        # ... (error handling as before) ...
         sys.exit(1)
 
     config['firmware'] = config.get('firmware') or detect_firmware_type(config.get('cdrom'))
