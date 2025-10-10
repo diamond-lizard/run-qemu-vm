@@ -75,10 +75,44 @@ USB_CONTROLLER = "qemu-xhci"
 KEYBOARD_DEVICE = "usb-kbd"
 # The virtual mouse/tablet device to attach in GUI mode for accurate cursor tracking.
 MOUSE_DEVICE = "usb-tablet"
-# The network backend configuration for user-mode networking.
-NETWORK_BACKEND = "user,id=net0"
+
+# --- Network Configuration ---
+
+# The network backend mode for QEMU user-mode networking (SLIRP/NAT).
+# Value: "user" enables user-mode networking which provides NAT to the guest.
+# This allows the guest to access the internet and the host, but the guest
+# is not directly accessible from the host without port forwarding.
+NETWORK_MODE = "user"
+
+# The network backend identifier used to link the backend to the network device.
+# Value: Any unique string identifier (commonly "net0").
+# This ID is referenced by NETWORK_DEVICE to connect the NIC to this backend.
+NETWORK_ID = "net0"
+
+# Port forwarding rules for accessing services running inside the guest VM.
+# Format: "hostfwd=<protocol>::<host_port>-:<guest_port>[,hostfwd=...]"
+#
+# Examples:
+#   - "hostfwd=tcp::2222-:22" forwards host port 2222 to guest SSH port 22
+#   - "hostfwd=tcp::8080-:80" forwards host port 8080 to guest HTTP port 80
+#   - Multiple forwards: "hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:80"
+#
+# To access the guest SSH server from the host:
+#   ssh -p 2222 username@localhost
+#
+# To disable port forwarding, set to empty string: ""
+NETWORK_PORT_FORWARDS = "hostfwd=tcp::2222-:22"
+
+# The complete network backend configuration string, assembled from the above variables.
+# This is constructed automatically; modify the individual variables above instead.
+NETWORK_BACKEND = f"{NETWORK_MODE},id={NETWORK_ID}" + (f",{NETWORK_PORT_FORWARDS}" if NETWORK_PORT_FORWARDS else "")
+
 # The virtual network interface card (NIC) device attached to the guest.
-NETWORK_DEVICE = "virtio-net-pci,netdev=net0"
+# Format: "<device_model>,netdev=<backend_id>"
+# Value: "virtio-net-pci" is the high-performance paravirtualized network device
+#        recommended for modern Linux guests. It requires virtio drivers in the guest OS.
+# The "netdev=net0" parameter links this NIC to the NETWORK_BACKEND with id "net0".
+NETWORK_DEVICE = f"virtio-net-pci,netdev={NETWORK_ID}"
 
 # --- Text Console Mode Constants ---
 MODE_SERIAL_CONSOLE = 'serial_console'
