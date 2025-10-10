@@ -7,13 +7,18 @@
 #   (UEFI or BIOS), and allows the user to choose between a graphical (GUI)
 #   or text-based (serial) console, with all combinations being supported.
 #
+#   In text console mode, the script provides built-in key translation for
+#   GRUB compatibility (backspace, arrow keys) and an integrated control menu
+#   for accessing the QEMU monitor.
+#
 # Usage:
 #   1. UEFI installation with a GUI:
 #      ./run-qemu-vm.py --disk-image my-os.qcow2 --cdrom uefi-installer.iso --console gui
 #
 #   2. UEFI installation with a text-only terminal:
 #      ./run-qemu-vm.py --disk-image my-os.qcow2 --cdrom uefi-installer.iso --console text
-#      # Then, in another terminal, connect with 'screen /dev/ttysXXX'
+#      # Script provides integrated terminal with working arrow keys and backspace
+#      # Press Ctrl-] for control menu
 #
 #   3. To see all available options:
 #      ./run-qemu-vm.py --help
@@ -31,6 +36,12 @@ import shutil
 import tempfile
 from pathlib import Path
 import re
+import select
+import termios
+import tty
+import socket
+import time
+import signal
 
 # --- Global Configuration & Executable Paths ---
 
@@ -68,6 +79,11 @@ MOUSE_DEVICE = "usb-tablet"
 NETWORK_BACKEND = "user,id=net0"
 # The virtual network interface card (NIC) device attached to the guest.
 NETWORK_DEVICE = "virtio-net-pci,netdev=net0"
+
+# --- Text Console Mode Constants ---
+MODE_SERIAL_CONSOLE = 'serial_console'
+MODE_CONTROL_MENU = 'control_menu'
+MODE_QEMU_MONITOR = 'qemu_monitor'
 
 def get_qemu_prefix(brew_executable):
     """Finds the Homebrew installation prefix for QEMU."""
@@ -164,10 +180,294 @@ def create_and_run_uefi_with_automation(base_args, config):
                 "-device", "usb-storage,drive=boot-script"
             ])
 
-            run_qemu(automated_args)
+            run_qemu(automated_args, config)
     else:
         print("Warning: Proceeding without boot automation script.", file=sys.stderr)
-        run_qemu(base_args)
+        run_qemu(base_args, config)
+
+
+class TextConsoleManager:
+    """Manages the text console mode with key translation and mode switching."""
+
+    def __init__(self, qemu_process, pty_device, monitor_socket):
+        self.qemu_process = qemu_process
+        self.pty_device = pty_device
+        self.monitor_socket_path = monitor_socket
+        self.pty_fd = None
+        self.monitor_sock = None
+        self.original_settings = None
+        self.current_mode = MODE_SERIAL_CONSOLE
+        self.stdin_fd = sys.stdin.fileno()
+        self.stdout_fd = sys.stdout.fileno()
+
+    def setup(self):
+        """Initialize PTY and monitor connections."""
+        try:
+            # Open PTY device
+            self.pty_fd = os.open(self.pty_device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+
+            # Set PTY to raw mode
+            try:
+                attrs = termios.tcgetattr(self.pty_fd)
+                attrs[0] = 0  # iflag
+                attrs[1] = 0  # oflag
+                attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL  # cflag
+                attrs[3] = 0  # lflag
+                termios.tcsetattr(self.pty_fd, termios.TCSANOW, attrs)
+            except:
+                pass
+
+            # Connect to monitor socket
+            self.monitor_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+            # Wait for monitor socket to be ready
+            for _ in range(20):
+                try:
+                    self.monitor_sock.connect(self.monitor_socket_path)
+                    break
+                except (FileNotFoundError, ConnectionRefusedError):
+                    time.sleep(0.1)
+            else:
+                print("Warning: Could not connect to QEMU monitor", file=sys.stderr)
+
+            # Consume initial monitor output
+            self.monitor_sock.setblocking(False)
+            try:
+                while True:
+                    data = self.monitor_sock.recv(4096)
+                    if not data:
+                        break
+            except BlockingIOError:
+                pass
+
+            # Save terminal settings and enter raw mode
+            self.original_settings = termios.tcgetattr(self.stdin_fd)
+            tty.setraw(self.stdin_fd)
+
+            print(f"\nConnected to serial console: {self.pty_device}")
+            print("Press Ctrl-] for control menu.\n")
+            sys.stdout.flush()
+
+            return True
+
+        except Exception as e:
+            print(f"Error setting up text console: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def translate_keys(self, data):
+        """Translate key sequences for GRUB compatibility."""
+        # Translate DEL (0x7f) to BS (0x08) for backspace
+        return data.replace(b'\x7f', b'\x08')
+
+    def enter_raw_mode(self):
+        """Put terminal in raw mode."""
+        tty.setraw(self.stdin_fd)
+
+    def restore_terminal(self):
+        """Restore terminal to original settings."""
+        if self.original_settings:
+            termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN, self.original_settings)
+
+    def show_control_menu(self):
+        """Display control menu and handle user choice."""
+        self.restore_terminal()
+
+        print("\n")
+        print("╔════════════════════════════════════╗")
+        print("║  run-qemu-vm.py Control Menu      ║")
+        print("╠════════════════════════════════════╣")
+        print("║  q - Quit QEMU and exit           ║")
+        print("║  m - Enter QEMU monitor           ║")
+        print("║  r - Resume serial console        ║")
+        print("╚════════════════════════════════════╝")
+        print()
+        print("Choice: ", end='', flush=True)
+
+        choice = sys.stdin.read(1)
+
+        if choice.lower() == 'q':
+            self.quit_qemu()
+            return False  # Signal to exit main loop
+        elif choice.lower() == 'm':
+            self.current_mode = MODE_QEMU_MONITOR
+            print("\nEntering QEMU monitor (Ctrl-] for menu)...")
+            print("(qemu) ", end='', flush=True)
+            self.enter_raw_mode()
+        else:  # 'r' or anything else
+            print("\nResuming serial console...")
+            sys.stdout.flush()
+            self.current_mode = MODE_SERIAL_CONSOLE
+            self.enter_raw_mode()
+
+        return True  # Continue main loop
+
+    def quit_qemu(self):
+        """Gracefully shutdown QEMU."""
+        print("\nShutting down VM...")
+        sys.stdout.flush()
+
+        try:
+            # Send quit command to monitor
+            self.monitor_sock.send(b"quit\n")
+
+            # Wait up to 5 seconds for graceful shutdown
+            for _ in range(50):
+                if self.qemu_process.poll() is not None:
+                    break
+                time.sleep(0.1)
+            else:
+                # Force kill if still running
+                self.qemu_process.kill()
+                self.qemu_process.wait()
+        except:
+            # If monitor command fails, just kill the process
+            self.qemu_process.kill()
+            self.qemu_process.wait()
+
+        print("VM stopped.")
+
+    def cleanup(self):
+        """Clean up resources."""
+        self.restore_terminal()
+
+        if self.pty_fd:
+            try:
+                os.close(self.pty_fd)
+            except:
+                pass
+
+        if self.monitor_sock:
+            try:
+                self.monitor_sock.close()
+            except:
+                pass
+
+    def run_serial_console_mode(self):
+        """Handle serial console interaction."""
+        try:
+            readable, _, _ = select.select([self.stdin_fd, self.pty_fd], [], [], 0.1)
+
+            if self.stdin_fd in readable:
+                # User typed something
+                try:
+                    data = os.read(self.stdin_fd, 1024)
+
+                    if b'\x1d' in data:  # Ctrl-]
+                        return self.show_control_menu()
+
+                    # Translate keys and send to guest
+                    translated = self.translate_keys(data)
+                    os.write(self.pty_fd, translated)
+
+                except OSError:
+                    pass
+
+            if self.pty_fd in readable:
+                # Guest sent output
+                try:
+                    data = os.read(self.pty_fd, 4096)
+                    if data:
+                        os.write(self.stdout_fd, data)
+                except OSError:
+                    pass
+
+            return True
+
+        except Exception as e:
+            print(f"\nError in serial console mode: {e}", file=sys.stderr)
+            return False
+
+    def run_monitor_mode(self):
+        """Handle QEMU monitor interaction."""
+        try:
+            readable, _, _ = select.select([self.stdin_fd, self.monitor_sock], [], [], 0.1)
+
+            if self.stdin_fd in readable:
+                # User typed something
+                try:
+                    data = os.read(self.stdin_fd, 1024)
+
+                    if b'\x1d' in data:  # Ctrl-]
+                        return self.show_control_menu()
+
+                    # Send to monitor (no translation)
+                    self.monitor_sock.send(data)
+
+                except OSError:
+                    pass
+
+            if self.monitor_sock in readable:
+                # Monitor sent output
+                try:
+                    data = self.monitor_sock.recv(4096)
+                    if data:
+                        os.write(self.stdout_fd, data)
+                except OSError:
+                    pass
+
+            return True
+
+        except Exception as e:
+            print(f"\nError in monitor mode: {e}", file=sys.stderr)
+            return False
+
+    def run(self):
+        """Main event loop."""
+        try:
+            while True:
+                # Check if QEMU died
+                if self.qemu_process.poll() is not None:
+                    self.restore_terminal()
+                    print("\n\nQEMU exited.")
+                    return self.qemu_process.returncode
+
+                # Route to appropriate mode handler
+                if self.current_mode == MODE_SERIAL_CONSOLE:
+                    if not self.run_serial_console_mode():
+                        return 0
+                elif self.current_mode == MODE_QEMU_MONITOR:
+                    if not self.run_monitor_mode():
+                        return 0
+
+        except KeyboardInterrupt:
+            self.restore_terminal()
+            print("\n\nInterrupted. Shutting down...")
+            self.quit_qemu()
+            return 130
+        finally:
+            self.cleanup()
+
+
+def parse_pty_device(qemu_process):
+    """Parse QEMU output to find the PTY device path."""
+    import fcntl
+
+    # Set stdout to non-blocking
+    flags = fcntl.fcntl(qemu_process.stdout, fcntl.F_GETFL)
+    fcntl.fcntl(qemu_process.stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    pty_device = None
+    start_time = time.time()
+
+    while time.time() - start_time < 5:  # Wait up to 5 seconds
+        try:
+            line = qemu_process.stdout.readline()
+            if line:
+                # Look for: char device redirected to /dev/ttysXXX (label char0)
+                match = re.search(r'char device redirected to (/dev/[^\s]+)', line)
+                if match:
+                    pty_device = match.group(1)
+                    print(f"Serial console: {pty_device}")
+                    break
+        except IOError:
+            pass
+
+        time.sleep(0.1)
+
+    return pty_device
+
 
 def build_qemu_args(config):
     """Constructs the list of arguments for the QEMU command from the config."""
@@ -218,9 +518,8 @@ def build_qemu_args(config):
                 final_args.extend(["-nographic", "-append", "console=ttyAMA0"])
             else:
                 print("Info: Using graphical (GUI) console for BIOS boot.")
-                # No extra args needed for GUI BIOS boot
 
-            run_qemu(final_args)
+            run_qemu(final_args, config)
             return
 
     # --- UEFI Configuration (Default) ---
@@ -233,13 +532,19 @@ def build_qemu_args(config):
     final_args.extend(uefi_args)
 
     if config['console'] == 'text':
-        print("Info: Using text-only (serial) console via pseudo-terminal (pty).")
+        print("Info: Using text-only (serial) console with integrated terminal.")
+
+        # Create monitor socket path
+        monitor_socket = f"/tmp/qemu-monitor-{os.getpid()}.sock"
+        config['monitor_socket'] = monitor_socket
+
         final_args.extend([
-            "-nographic",
+            "-monitor", f"unix:{monitor_socket},server,nowait",
             "-chardev", "pty,id=char0",
             "-serial", "chardev:char0",
+            "-nographic",
         ])
-    else: # gui
+    else:  # gui
         print("Info: Using graphical (GUI) console.")
         if not config['graphics_device']:
             config['graphics_device'] = 'virtio-gpu-pci'
@@ -257,7 +562,7 @@ def build_qemu_args(config):
     if boot_device == 'cdrom' and config["cdrom"]:
         create_and_run_uefi_with_automation(final_args, config)
     else:
-        run_qemu(final_args)
+        run_qemu(final_args, config)
 
 
 def prepare_uefi_vars_file(vars_path, code_path):
@@ -291,17 +596,51 @@ def prepare_uefi_vars_file(vars_path, code_path):
             sys.exit(1)
 
 
-def run_qemu(args):
-    """Executes the QEMU command and handles interrupts."""
+def run_qemu(args, config):
+    """Executes the QEMU command and handles text console if needed."""
     print("--- Starting QEMU with the following command ---")
     print(subprocess.list2cmdline(args))
     print("-------------------------------------------------")
+
     try:
-        process = subprocess.Popen(args)
-        process.wait()
+        if config.get('console') == 'text':
+            # Start QEMU with stdout capture to parse PTY device
+            process = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+
+            # Parse PTY device from output
+            pty_device = parse_pty_device(process)
+
+            if not pty_device:
+                print("Error: Could not find PTY device in QEMU output", file=sys.stderr)
+                process.kill()
+                sys.exit(1)
+
+            # Create and run text console manager
+            console = TextConsoleManager(process, pty_device, config['monitor_socket'])
+
+            if not console.setup():
+                process.kill()
+                sys.exit(1)
+
+            return_code = console.run()
+            sys.exit(return_code)
+
+        else:
+            # GUI mode - just run normally
+            process = subprocess.Popen(args)
+            process.wait()
+
     except FileNotFoundError:
+        print(f"Error: QEMU executable '{args[0]}' not found", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
+        print("\nInterrupted")
         sys.exit(130)
 
     if 'process' in locals() and process.returncode != 0:
@@ -328,7 +667,7 @@ def main():
     )
     parser.add_argument(
         "--console", choices=['gui', 'text'], default='gui',
-        help="Choose the console type. 'gui' for a graphical window, 'text' for a serial console in the terminal."
+        help="Choose the console type. 'gui' for a graphical window, 'text' for an integrated serial console with key translation."
     )
 
     # Executable paths
@@ -357,8 +696,10 @@ def main():
 
     # --- Post-processing and Validation ---
     if not os.path.exists(config["disk_image"]):
+        print(f"Error: Disk image not found: {config['disk_image']}", file=sys.stderr)
         sys.exit(1)
     if config["cdrom"] and not os.path.exists(config["cdrom"]):
+        print(f"Error: CD-ROM image not found: {config['cdrom']}", file=sys.stderr)
         sys.exit(1)
 
     config['firmware'] = config.get('firmware') or detect_firmware_type(config.get('cdrom'))
