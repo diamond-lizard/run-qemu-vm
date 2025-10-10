@@ -215,11 +215,13 @@ def build_qemu_args(config):
     else: # text console
         print("Info: Using text-only (serial) console.")
         args.extend([
-            # -display curses provides a text-based console that correctly
-            # handles special keys (arrows, backspace) and allows Ctrl-C to work.
-            # It replaces -nographic.
-            "-display", "curses",
-            "-serial", "stdio",
+            "-nographic",
+            # This combination provides a multiplexed stdio character device
+            # that correctly handles terminal key escape codes without
+            # capturing Ctrl-C.
+            "-chardev", "stdio,id=char0,mux=on",
+            "-serial", "chardev:char0",
+            "-mon", "chardev=char0",
         ])
 
     # --- Firmware-Specific Configuration ---
@@ -313,8 +315,9 @@ def run_qemu(args):
     print("--- Starting QEMU with the following command ---")
     print(subprocess.list2cmdline(args))
     print("-------------------------------------------------")
-    if "curses" in args:
-        print(">>> QEMU using curses display. To exit, press Ctrl-C. <<<")
+    # Check for the multiplexed chardev setup
+    if "-chardev" in " ".join(args):
+        print(">>> QEMU using multiplexed serial console. To exit, press Ctrl-A then X. <<<")
     try:
         process = subprocess.Popen(args)
         process.wait()
