@@ -2,29 +2,28 @@
 
 #
 # Description:
-#   This script launches a QEMU virtual machine to install or run an AArch64
-#   (ARM64) operating system. It intelligently selects the required firmware
-#   (UEFI or BIOS), and allows the user to choose between a graphical (GUI)
-#   or text-based (serial) console, with all combinations being supported.
-#
-#   In text console mode, the script provides built-in key translation for
-#   GRUB compatibility (backspace, arrow keys) and an integrated control menu
-#   for accessing the QEMU monitor.
+#   This script launches a QEMU virtual machine to install or run an operating
+#   system for a specified architecture (e.g., aarch64, x86_64). It intelligently
+#   selects the required firmware (UEFI or BIOS) and allows the user to choose
+#   between a graphical (GUI) or text-based (serial) console.
 #
 # Usage:
-#   1. UEFI installation with a GUI:
-#      ./run-qemu-vm.py --disk-image my-os.qcow2 --cdrom uefi-installer.iso --console gui
+#   1. List available architectures:
+#      ./run-qemu-vm.py --architecture list
 #
-#   2. UEFI installation with a text-only terminal:
-#      ./run-qemu-vm.py --disk-image my-os.qcow2 --cdrom uefi-installer.iso --console text
+#   2. UEFI installation with a GUI (AArch64):
+#      ./run-qemu-vm.py --architecture aarch64 --disk-image my-os.qcow2 --cdrom uefi-installer.iso --console gui
+#
+#   3. UEFI installation with a text-only terminal (x86_64):
+#      ./run-qemu-vm.py --architecture x86_64 --disk-image my-x86.qcow2 --cdrom ubuntu.iso --console text
 #      # Script provides integrated terminal with working arrow keys and backspace
 #      # Press Ctrl-] for control menu
 #
-#   3. Share a directory with the guest:
-#      ./run-qemu-vm.py --disk-image my-os.qcow2 --share-dir /path/on/host:sharename
+#   4. Share a directory with the guest:
+#      ./run-qemu-vm.py --architecture riscv64 --disk-image my-riscv.qcow2 --share-dir /path/on/host:sharename
 #      # Inside guest: sudo mount -t 9p -o trans=virtio sharename /mnt/shared
 #
-#   4. To see all available options:
+#   5. To see all available options:
 #      ./run-qemu-vm.py --help
 #
 # Prerequisites:
@@ -50,13 +49,21 @@ import signal
 
 # --- Global Configuration & Executable Paths ---
 
+# List of supported QEMU architectures
+SUPPORTED_ARCHITECTURES = [
+    "aarch64", "alpha", "arm", "avr", "hppa", "i386", "loongarch64", "m68k",
+    "microblaze", "microblazeel", "mips", "mips64", "mips64el", "mipsel",
+    "or1k", "ppc", "ppc64", "riscv32", "riscv64", "rx", "s390x", "sh4",
+    "sh4eb", "sparc", "sparc64", "tricore", "x86_64", "xtensa", "xtensaeb"
+]
+
 # The command for the Homebrew package manager, used to auto-locate QEMU files.
 BREW_EXECUTABLE = "brew"
-# The specific QEMU binary for emulating a 64-bit ARM system.
-QEMU_EXECUTABLE = "qemu-system-aarch64"
+# The specific QEMU binary for emulating a system. This will be set based on --architecture.
+QEMU_EXECUTABLE = None
 # The command for the 7-Zip archive tool, used to extract kernel/initrd from ISOs.
 SEVEN_ZIP_EXECUTABLE = "7z"
-# The virtual machine type QEMU will emulate; 'virt' is the modern standard for ARM.
+# The virtual machine type QEMU will emulate; 'virt' is a modern standard for many architectures.
 MACHINE_TYPE = "virt"
 # The hardware virtualization framework to use; 'hvf' is native to macOS on ARM.
 ACCELERATOR = "hvf"
@@ -193,24 +200,48 @@ def get_qemu_prefix(brew_executable):
         )
         sys.exit(1)
 
-def detect_firmware_type(iso_path):
+def detect_firmware_type(iso_path, architecture):
     """
-    Detects the firmware type for an AArch64 ISO.
-    For AArch64, the standard is UEFI. This function defaults to 'uefi'
-    and only switches to 'bios' for special-purpose direct-kernel images.
+    Detects the firmware type for an ISO based on architecture and filename.
+    Defaults to 'uefi' for common modern architectures.
     """
     if not iso_path:
-        return 'uefi'
+        # Default to UEFI for common 64-bit architectures if no ISO is provided
+        if architecture in ['aarch64', 'x86_64', 'riscv64']:
+            return 'uefi'
+        return 'bios' # Fallback for other architectures
 
+    # Specific filename check
     if 'bios' in Path(iso_path).name.lower():
          print("Info: ISO filename suggests BIOS/direct-kernel boot.")
          return 'bios'
 
+    # For AArch64, UEFI is standard
+    if architecture == 'aarch64':
+        return 'uefi'
+
+    # Default to UEFI for other common 64-bit architectures
+    if architecture in ['x86_64', 'riscv64']:
+        return 'uefi'
+
+    # Fallback default
     return 'uefi'
 
-def find_uefi_bootloader(seven_zip_executable, iso_path):
-    """Inspects an ISO to find the AArch64 UEFI bootloader file."""
-    print(f"Info: Searching for UEFI bootloader in '{iso_path}'...")
+
+def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
+    """Inspects an ISO to find the UEFI bootloader file for the given architecture."""
+    bootloader_patterns = {
+        'aarch64': ['bootaa64.efi'],
+        'x86_64': ['bootx64.efi'],
+        'riscv64': ['bootriscv64.efi']
+        # Add other architecture bootloader filenames here if needed
+    }
+    patterns = bootloader_patterns.get(architecture)
+    if not patterns:
+        print(f"Warning: No known UEFI bootloader pattern for architecture '{architecture}'.", file=sys.stderr)
+        return None, None
+
+    print(f"Info: Searching for UEFI bootloader in '{iso_path}' for {architecture}...")
     try:
         result = subprocess.run(
             [seven_zip_executable, 'l', iso_path],
@@ -224,12 +255,15 @@ def find_uefi_bootloader(seven_zip_executable, iso_path):
 
     bootloader_full_path = None
     for line in result.stdout.splitlines():
-        if "bootaa64.efi" in line.lower():
-            parts = line.split()
-            if len(parts) > 0 and parts[-1].lower().endswith('bootaa64.efi'):
-                 if 'efi' in parts[-1].lower() and 'boot' in parts[-1].lower():
-                    bootloader_full_path = parts[-1]
-                    break
+        for pattern in patterns:
+            if pattern in line.lower():
+                parts = line.split()
+                if len(parts) > 0 and parts[-1].lower().endswith(pattern):
+                    if 'efi' in parts[-1].lower() and 'boot' in parts[-1].lower():
+                        bootloader_full_path = parts[-1]
+                        break
+        if bootloader_full_path:
+            break
 
     if bootloader_full_path:
         p = Path(bootloader_full_path)
@@ -238,7 +272,7 @@ def find_uefi_bootloader(seven_zip_executable, iso_path):
         print(f"Info: Found UEFI bootloader: {bootloader_name} at path {bootloader_full_path}")
         return bootloader_name, bootloader_script_path
 
-    print("Warning: Could not find 'bootaa64.efi' in the ISO. Automatic boot may fail.", file=sys.stderr)
+    print(f"Warning: Could not find a suitable bootloader ({', '.join(patterns)}) in the ISO. Automatic boot may fail.", file=sys.stderr)
     return None, None
 
 
@@ -397,7 +431,9 @@ def create_and_run_uefi_with_automation(base_args, config):
     """
     Creates a temporary startup.nsh to automate UEFI boot and runs QEMU.
     """
-    bootloader_name, bootloader_script_path = find_uefi_bootloader(config['seven_zip_executable'], config['cdrom'])
+    bootloader_name, bootloader_script_path = find_uefi_bootloader(
+        config['seven_zip_executable'], config['cdrom'], config['architecture']
+    )
 
     if bootloader_name and bootloader_script_path:
         with tempfile.TemporaryDirectory(prefix="qemu-uefi-boot-") as temp_dir:
@@ -751,10 +787,15 @@ def build_qemu_args(config):
         with tempfile.TemporaryDirectory(prefix="qemu-bios-boot-") as temp_dir:
             print(f"Info: Extracting kernel and initrd to temporary directory: {temp_dir}")
             try:
+                # This part is highly specific to the ISO structure and may fail.
+                # Example for Debian-like aarch64 installers
+                kernel_file = "install.a64/vmlinuz"
+                initrd_file = "install.a64/initrd.gz"
+
                 subprocess.run(
                     [
                         config["seven_zip_executable"], "e", config["cdrom"],
-                        "install.a64/vmlinuz", "install.a64/initrd.gz",
+                        kernel_file, initrd_file,
                         f"-o{temp_dir}"
                     ],
                     check=True, capture_output=True, text=True
@@ -782,13 +823,17 @@ def build_qemu_args(config):
             return
 
     # --- UEFI Configuration (Default) ---
-    uefi_args = [
-        "-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}",
-        "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}",
-    ]
+    if config.get('uefi_code') and config.get('uefi_vars'):
+        uefi_args = [
+            "-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}",
+            "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}",
+        ]
+        final_args = list(base_args)
+        final_args.extend(uefi_args)
+    else:
+        print("Warning: UEFI firmware paths not set. Proceeding without UEFI.", file=sys.stderr)
+        final_args = list(base_args)
 
-    final_args = list(base_args)
-    final_args.extend(uefi_args)
 
     if config['console'] == 'text':
         print("Info: Using text-only (serial) console with integrated terminal.")
@@ -806,7 +851,11 @@ def build_qemu_args(config):
     else:  # gui
         print("Info: Using graphical (GUI) console.")
         if not config['graphics_device']:
-            config['graphics_device'] = 'virtio-gpu-pci'
+            # Select a default graphics device based on architecture
+            if config['architecture'] in ['x86_64', 'aarch64']:
+                 config['graphics_device'] = 'virtio-gpu-pci'
+            else:
+                 config['graphics_device'] = 'VGA' # A safe fallback
         final_args.extend([
             "-device", config["graphics_device"],
             "-display", config["display_type"],
@@ -818,7 +867,7 @@ def build_qemu_args(config):
     boot_order = 'd' if boot_device == 'cdrom' else 'c'
     final_args.extend(["-boot", f"order={boot_order}"])
 
-    if boot_device == 'cdrom' and config["cdrom"]:
+    if boot_device == 'cdrom' and config["cdrom"] and config['firmware'] == 'uefi':
         create_and_run_uefi_with_automation(final_args, config)
     else:
         run_qemu(final_args, config)
@@ -897,6 +946,7 @@ def run_qemu(args, config):
 
     except FileNotFoundError:
         print(f"Error: QEMU executable '{args[0]}' not found", file=sys.stderr)
+        print(f"       Please ensure QEMU is installed and '{args[0]}' is in your PATH.", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nInterrupted")
@@ -909,7 +959,7 @@ def run_qemu(args, config):
 def main():
     """Parses command-line arguments and launches the VM."""
     parser = argparse.ArgumentParser(
-        description="Launch a QEMU AArch64 virtual machine with fully independent display and firmware options.",
+        description="Launch a QEMU virtual machine with a specified architecture, display, and firmware options.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Directory Sharing (VirtFS):
@@ -939,7 +989,13 @@ Directory Sharing (VirtFS):
     )
 
     # --- Argument Definitions ---
-    parser.add_argument("--disk-image", required=True, help="Path to the primary virtual hard disk image (.qcow2).")
+    parser.add_argument(
+        "--architecture",
+        required=True,
+        help="The QEMU system architecture to use (e.g., aarch64, x86_64, riscv64). "
+             "Use 'list' to see all available architectures."
+    )
+    parser.add_argument("--disk-image", help="Path to the primary virtual hard disk image (.qcow2).")
     parser.add_argument("--cdrom", help="Path to a bootable ISO file (for installation).")
     parser.add_argument(
         "--boot-from", choices=['cdrom', 'hd'],
@@ -947,7 +1003,7 @@ Directory Sharing (VirtFS):
     )
     parser.add_argument(
         "--firmware", choices=['uefi', 'bios'],
-        help="Specify firmware mode. 'uefi' (default) uses firmware to boot. 'bios' uses direct kernel boot."
+        help="Specify firmware mode. 'uefi' (default for many archs) uses firmware to boot. 'bios' uses direct kernel boot."
     )
     parser.add_argument(
         "--console", choices=['gui', 'text'], default='gui',
@@ -963,13 +1019,13 @@ Directory Sharing (VirtFS):
     )
 
     # Executable paths
-    parser.add_argument("--qemu-executable", default=QEMU_EXECUTABLE, help="Path to the QEMU binary.")
+    parser.add_argument("--qemu-executable", default=QEMU_EXECUTABLE, help=argparse.SUPPRESS) # Suppress from help
     parser.add_argument("--seven-zip-executable", default=SEVEN_ZIP_EXECUTABLE, help="Path to the 7z binary.")
     parser.add_argument("--brew-executable", default=BREW_EXECUTABLE, help="Path to the Homebrew binary.")
 
     # VM configuration
-    parser.add_argument("--machine-type", default=MACHINE_TYPE, help="QEMU machine type.")
-    parser.add_argument("--accelerator", default=ACCELERATOR, help="VM accelerator to use.")
+    parser.add_argument("--machine-type", default=MACHINE_TYPE, help="QEMU machine type (e.g., virt, q35).")
+    parser.add_argument("--accelerator", default=ACCELERATOR, help="VM accelerator to use (e.g., hvf, kvm, tcg).")
     parser.add_argument("--cpu-model", default=CPU_MODEL, help="CPU model to emulate.")
     parser.add_argument("--memory", default=MEMORY, help="RAM to allocate to the VM.")
     parser.add_argument("--smp-cores", type=int, default=SMP_CORES, help="Number of CPU cores for the VM.")
@@ -984,9 +1040,29 @@ Directory Sharing (VirtFS):
     parser.add_argument("--network-device", default=NETWORK_DEVICE, help="Virtual network interface.")
 
     args = parser.parse_args()
+
+    # Handle --architecture list
+    if args.architecture == 'list':
+        print("Available QEMU architectures:")
+        for arch in SUPPORTED_ARCHITECTURES:
+            print(f"  - {arch}")
+        sys.exit(0)
+
+    # Validate architecture
+    if args.architecture not in SUPPORTED_ARCHITECTURES:
+        print(f"Error: Unsupported architecture '{args.architecture}'.", file=sys.stderr)
+        print("Use '--architecture list' to see available options.", file=sys.stderr)
+        sys.exit(1)
+
+    # A disk image is required unless listing architectures
+    if not args.disk_image:
+        parser.error("--disk-image is required when running a VM.")
+
     config = vars(args)
 
     # --- Post-processing and Validation ---
+    config['qemu_executable'] = f"qemu-system-{config['architecture']}"
+
     if not os.path.exists(config["disk_image"]):
         print(f"Error: Disk image not found: {config['disk_image']}", file=sys.stderr)
         sys.exit(1)
@@ -994,18 +1070,41 @@ Directory Sharing (VirtFS):
         print(f"Error: CD-ROM image not found: {config['cdrom']}", file=sys.stderr)
         sys.exit(1)
 
-    config['firmware'] = config.get('firmware') or detect_firmware_type(config.get('cdrom'))
+    config['firmware'] = config.get('firmware') or detect_firmware_type(config.get('cdrom'), config['architecture'])
+
+    # Architecture-specific defaults
+    if config['architecture'] == 'x86_64':
+        if config['machine_type'] == 'virt': # virt is not ideal for x86
+            config['machine_type'] = 'q35' # q35 is a more modern default for x86_64
 
     if config['firmware'] == 'uefi':
-        qemu_prefix = get_qemu_prefix(config['brew_executable'])
-        if not config["uefi_code"]:
-            config["uefi_code"] = str(qemu_prefix / "share/qemu/edk2-aarch64-code.fd")
-        if not config["uefi_vars"]:
-            disk_path = Path(config["disk_image"])
-            disk_stem = disk_path.stem
-            vars_filename = f"{disk_stem}--persistent-variables.fd"
-            config["uefi_vars"] = str(disk_path.parent / vars_filename)
-        prepare_uefi_vars_file(config["uefi_vars"], config["uefi_code"])
+        uefi_fw_files = {
+            'aarch64': 'edk2-aarch64-code.fd',
+            'x86_64': 'edk2-x86_64-code.fd',
+            'riscv64': 'edk2-riscv64-code.fd'
+            # Add other firmware files here
+        }
+        fw_filename = uefi_fw_files.get(config['architecture'])
+
+        if fw_filename:
+            qemu_prefix = get_qemu_prefix(config['brew_executable'])
+            if not config["uefi_code"]:
+                config["uefi_code"] = str(qemu_prefix / "share/qemu" / fw_filename)
+            if not config["uefi_vars"]:
+                disk_path = Path(config["disk_image"])
+                disk_stem = disk_path.stem
+                vars_filename = f"{disk_stem}-{config['architecture']}-vars.fd"
+                config["uefi_vars"] = str(disk_path.parent / vars_filename)
+
+            if os.path.exists(config["uefi_code"]):
+                prepare_uefi_vars_file(config["uefi_vars"], config["uefi_code"])
+            else:
+                print(f"Warning: UEFI firmware '{fw_filename}' not found at expected path. Disabling UEFI.", file=sys.stderr)
+                config['firmware'] = 'bios' # Fallback to BIOS if firmware not found
+        else:
+            print(f"Info: No standard UEFI firmware file known for architecture '{config['architecture']}'. Assuming BIOS boot.", file=sys.stderr)
+            config['firmware'] = 'bios'
+
 
     build_qemu_args(config)
 
