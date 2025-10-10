@@ -217,7 +217,9 @@ def build_qemu_args(config):
         args.extend([
             "-nographic",
             "-monitor", "null",
-            "-serial", "stdio",
+            # Use mon:stdio to enable QEMU's terminal emulation,
+            # which fixes key mapping issues for backspace and arrow keys.
+            "-serial", "mon:stdio",
         ])
 
     # --- Firmware-Specific Configuration ---
