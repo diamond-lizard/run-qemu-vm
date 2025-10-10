@@ -13,21 +13,14 @@
 #
 #   2. UEFI installation with a text-only terminal:
 #      ./run-qemu-vm.py --disk-image my-os.qcow2 --cdrom uefi-installer.iso --console text
+#      # Then, in another terminal, connect with 'screen /dev/ttysXXX'
 #
-#   3. Direct-kernel (BIOS) installation with a text-only terminal:
-#      ./run-qemu-vm.py --disk-image my-os.qcow2 --cdrom bios-installer.iso --firmware bios --console text
-#
-#   4. Direct-kernel (BIOS) installation with a GUI:
-#      ./run-qemu-vm.py --disk-image my-os.qcow2 --cdrom bios-installer.iso --firmware bios --console gui
-#
-#   5. To see all available options:
+#   3. To see all available options:
 #      ./run-qemu-vm.py --help
 #
 # Prerequisites:
 #   - QEMU must be installed (e.g., via `brew install qemu`).
-#   - The `file` command-line utility must be available.
 #   - For BIOS/serial installations, '7z' must be in the PATH (from 'p7zip').
-#   - The necessary disk image and ISO files must exist at the specified paths.
 #
 
 import argparse
