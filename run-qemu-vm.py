@@ -178,7 +178,7 @@ def create_and_run_uefi_with_automation(base_args, config):
 
 def build_qemu_args(config):
     """Constructs the list of arguments for the QEMU command from the config."""
-    args = [
+    base_args = [
         config["qemu_executable"],
         "-M", config["machine_type"],
         "-accel", config["accelerator"],
@@ -188,46 +188,17 @@ def build_qemu_args(config):
         "-netdev", config["network_backend"],
         "-device", config["network_device"],
         "-hda", config["disk_image"],
-        # Add USB controller unconditionally, as it's needed for boot automation
-        # and does not require a GUI.
         "-device", config["usb_controller"],
     ]
 
     if config["cdrom"]:
-        args.extend(["-cdrom", config["cdrom"]])
-
-    # --- Console Configuration (Fully Decoupled) ---
-    if config['console'] == 'gui':
-        print("Info: Using graphical (GUI) console.")
-        # Ensure a graphics device is set for GUI mode.
-        if not config['graphics_device']:
-            config['graphics_device'] = 'virtio-gpu-pci'
-        args.extend([
-            "-device", config["graphics_device"],
-            "-display", config["display_type"],
-            # Add input devices only for GUI mode.
-            "-device", config["keyboard_device"],
-            "-device", config["mouse_device"],
-        ])
-    else: # text console
-        print("Info: Using text-only (serial) console via pseudo-terminal (pty).")
-        args.extend([
-            "-nographic",
-            # This creates a pseudo-terminal on the host. QEMU will print its path.
-            "-chardev", "pty,id=char0",
-            "-serial", "chardev:char0",
-        ])
+        base_args.extend(["-cdrom", config["cdrom"]])
 
     # --- Firmware-Specific Configuration ---
     if config['firmware'] == 'bios':
-        if not config["cdrom"]:
-            print("Error: --cdrom is required for BIOS installation mode.", file=sys.stderr)
-            sys.exit(1)
-
         with tempfile.TemporaryDirectory(prefix="qemu-bios-boot-") as temp_dir:
             print(f"Info: Extracting kernel and initrd to temporary directory: {temp_dir}")
             try:
-                # ... (extraction logic as before) ...
                 subprocess.run(
                     [
                         config["seven_zip_executable"], "e", config["cdrom"],
@@ -237,40 +208,64 @@ def build_qemu_args(config):
                     check=True, capture_output=True, text=True
                 )
             except (FileNotFoundError, subprocess.CalledProcessError) as e:
-                # ... (error handling as before) ...
+                print(f"Error extracting kernel/initrd: {e.stderr}", file=sys.stderr)
                 sys.exit(1)
 
             kernel_path = os.path.join(temp_dir, "vmlinuz")
             initrd_path = os.path.join(temp_dir, "initrd.gz")
             if not (os.path.exists(kernel_path) and os.path.exists(initrd_path)):
-                # ... (error handling as before) ...
+                print("Error: Could not find vmlinuz or initrd.gz in the ISO.", file=sys.stderr)
                 sys.exit(1)
 
-            args.extend([
-                "-kernel", kernel_path,
-                "-initrd", initrd_path,
-            ])
-            # CRITICAL: Only append serial console args if in text mode.
+            final_args = list(base_args)
+            final_args.extend(["-kernel", kernel_path, "-initrd", initrd_path])
+
             if config['console'] == 'text':
-                args.extend(["-append", "console=ttyAMA0"])
+                print("Info: Using text-only (serial) console for BIOS boot.")
+                final_args.extend(["-nographic", "-append", "console=ttyAMA0"])
+            else:
+                print("Info: Using graphical (GUI) console for BIOS boot.")
+                # No extra args needed for GUI BIOS boot
 
-            run_qemu(args)
+            run_qemu(final_args)
+            return
 
-    else: # uefi mode
-        args.extend([
-            "-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}",
-            "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}",
+    # --- UEFI Configuration (Default) ---
+    uefi_args = [
+        "-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}",
+        "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}",
+    ]
+
+    final_args = list(base_args)
+    final_args.extend(uefi_args)
+
+    if config['console'] == 'text':
+        print("Info: Using text-only (serial) console via pseudo-terminal (pty).")
+        final_args.extend([
+            "-nographic",
+            "-chardev", "pty,id=char0",
+            "-serial", "chardev:char0",
+        ])
+    else: # gui
+        print("Info: Using graphical (GUI) console.")
+        if not config['graphics_device']:
+            config['graphics_device'] = 'virtio-gpu-pci'
+        final_args.extend([
+            "-device", config["graphics_device"],
+            "-display", config["display_type"],
+            "-device", config["keyboard_device"],
+            "-device", config["mouse_device"],
         ])
 
-        boot_device = config.get("boot_from") or ('cdrom' if config["cdrom"] else 'hd')
-        boot_order = 'd' if boot_device == 'cdrom' else 'c'
-        args.extend(["-boot", f"order={boot_order}"])
+    boot_device = config.get("boot_from") or ('cdrom' if config["cdrom"] else 'hd')
+    boot_order = 'd' if boot_device == 'cdrom' else 'c'
+    final_args.extend(["-boot", f"order={boot_order}"])
 
-        # Engage automation if booting from CD-ROM in UEFI mode.
-        if boot_device == 'cdrom' and config["cdrom"]:
-            create_and_run_uefi_with_automation(args, config)
-        else:
-            run_qemu(args)
+    if boot_device == 'cdrom' and config["cdrom"]:
+        create_and_run_uefi_with_automation(final_args, config)
+    else:
+        run_qemu(final_args)
+
 
 def prepare_uefi_vars_file(vars_path, code_path):
     """
