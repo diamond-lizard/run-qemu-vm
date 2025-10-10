@@ -95,29 +95,23 @@ def get_qemu_prefix(brew_executable):
 
 def detect_firmware_type(iso_path):
     """
-    Detects the required firmware type (bios or uefi) for a given ISO.
-    Defaults to 'uefi' if no ISO is provided or if detection fails.
+    Detects the firmware type for an AArch64 ISO.
+    For AArch64, the standard is UEFI. This function defaults to 'uefi'
+    and only switches to 'bios' if specifically named for a direct-kernel boot.
     """
     if not iso_path:
         return 'uefi'
 
-    try:
-        result = subprocess.run(
-            ['file', '--brief', iso_path],
-            capture_output=True, text=True, check=True
-        )
-        # If the file description contains "MBR boot sector", it's a legacy BIOS image.
-        if 'MBR boot sector' in result.stdout:
-            print("Info: Legacy BIOS ISO detected. Switching to serial console mode.")
-            return 'bios'
-        return 'uefi'
-    except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        print(
-            f"Warning: Could not run 'file' command to detect ISO type (Error: {e}). "
-            "Defaulting to UEFI firmware. Use --firmware if this is incorrect.",
-            file=sys.stderr
-        )
-        return 'uefi'
+    # A more robust check could look for specific filenames if needed,
+    # but for AArch64, defaulting to UEFI is the correct approach.
+    # The 'MBR boot sector' check is incorrect and has been removed.
+
+    # For example, you could check if "bios" is in the filename as a convention
+    if 'bios' in Path(iso_path).name.lower():
+         print("Info: ISO filename suggests BIOS/direct-kernel boot. Switching to serial console.")
+         return 'bios'
+
+    return 'uefi'
 
 def build_qemu_args(config):
     """Constructs the list of arguments for the QEMU command from the config."""
