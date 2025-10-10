@@ -20,12 +20,17 @@
 #      # Script provides integrated terminal with working arrow keys and backspace
 #      # Press Ctrl-] for control menu
 #
-#   3. To see all available options:
+#   3. Share a directory with the guest:
+#      ./run-qemu-vm.py --disk-image my-os.qcow2 --share-dir /path/on/host:sharename
+#      # Inside guest: sudo mount -t 9p -o trans=virtio sharename /mnt/shared
+#
+#   4. To see all available options:
 #      ./run-qemu-vm.py --help
 #
 # Prerequisites:
 #   - QEMU must be installed (e.g., via `brew install qemu`).
 #   - For BIOS/serial installations, '7z' must be in the PATH (from 'p7zip').
+#   - For directory sharing, guest kernel must have 9P support (CONFIG_9P_FS).
 #
 
 import argparse
@@ -114,6 +119,21 @@ NETWORK_BACKEND = f"{NETWORK_MODE},id={NETWORK_ID}" + (f",{NETWORK_PORT_FORWARDS
 # The "netdev=net0" parameter links this NIC to the NETWORK_BACKEND with id "net0".
 NETWORK_DEVICE = f"virtio-net-pci,netdev={NETWORK_ID}"
 
+# --- Directory Sharing Configuration ---
+
+# VirtFS security model for shared directories.
+# Values:
+#   - "mapped-xattr": Stores guest permissions in host extended attributes (recommended)
+#   - "mapped-file": Stores permissions in hidden files (fallback if xattr not supported)
+#   - "passthrough": Direct mapping (requires QEMU to run as root, not recommended)
+#   - "none": No permission mapping (simplest but least secure)
+VIRTFS_SECURITY_MODEL = "mapped-xattr"
+
+# VirtFS 9P protocol version.
+# Value: "9p2000.L" is the Linux version with better performance and POSIX semantics.
+# Alternative: "9p2000.u" for older systems.
+VIRTFS_VERSION = "9p2000.L"
+
 # --- Text Console Mode Constants ---
 MODE_SERIAL_CONSOLE = 'serial_console'
 MODE_CONTROL_MENU = 'control_menu'
@@ -183,6 +203,50 @@ def find_uefi_bootloader(seven_zip_executable, iso_path):
 
     print("Warning: Could not find 'bootaa64.efi' in the ISO. Automatic boot may fail.", file=sys.stderr)
     return None, None
+
+
+def parse_share_dir_argument(share_dir_arg):
+    """
+    Parse the --share-dir argument into host path and mount tag.
+
+    Format: /host/path:mount_tag
+
+    Returns: (host_path, mount_tag) or (None, None) if invalid
+    """
+    if not share_dir_arg:
+        return None, None
+
+    if ':' not in share_dir_arg:
+        print(f"Error: --share-dir format must be '/host/path:mount_tag'", file=sys.stderr)
+        print(f"Example: --share-dir /Users/myuser/projects:hostshare", file=sys.stderr)
+        return None, None
+
+    parts = share_dir_arg.rsplit(':', 1)
+    if len(parts) != 2:
+        print(f"Error: Invalid --share-dir format: {share_dir_arg}", file=sys.stderr)
+        return None, None
+
+    host_path, mount_tag = parts
+
+    # Validate host path exists
+    if not os.path.exists(host_path):
+        print(f"Error: Host directory does not exist: {host_path}", file=sys.stderr)
+        return None, None
+
+    if not os.path.isdir(host_path):
+        print(f"Error: Host path is not a directory: {host_path}", file=sys.stderr)
+        return None, None
+
+    # Validate mount tag (alphanumeric and underscore only)
+    if not re.match(r'^[a-zA-Z0-9_]+$', mount_tag):
+        print(f"Error: Mount tag must be alphanumeric: {mount_tag}", file=sys.stderr)
+        print(f"Valid examples: hostshare, myfiles, shared_docs", file=sys.stderr)
+        return None, None
+
+    # Convert to absolute path
+    host_path = os.path.abspath(host_path)
+
+    return host_path, mount_tag
 
 
 def create_and_run_uefi_with_automation(base_args, config):
@@ -521,6 +585,23 @@ def build_qemu_args(config):
     if config["cdrom"]:
         base_args.extend(["-cdrom", config["cdrom"]])
 
+    # --- Directory Sharing via VirtFS (Optional) ---
+    if config.get("share_dir"):
+        host_path, mount_tag = parse_share_dir_argument(config["share_dir"])
+        if host_path and mount_tag:
+            print(f"Info: Sharing host directory '{host_path}' as '{mount_tag}'")
+            print(f"      Mount in guest with: sudo mkdir -p /mnt/{mount_tag} && sudo mount -t 9p -o trans=virtio,version={VIRTFS_VERSION} {mount_tag} /mnt/{mount_tag}")
+
+            # Build VirtFS arguments
+            virtfs_args = [
+                "-virtfs",
+                f"local,path={host_path},mount_tag={mount_tag},security_model={VIRTFS_SECURITY_MODEL},id={mount_tag}"
+            ]
+            base_args.extend(virtfs_args)
+        else:
+            print("Error: Invalid --share-dir argument. Directory sharing disabled.", file=sys.stderr)
+            sys.exit(1)
+
     # --- Firmware-Specific Configuration ---
     if config['firmware'] == 'bios':
         with tempfile.TemporaryDirectory(prefix="qemu-bios-boot-") as temp_dir:
@@ -685,7 +766,22 @@ def main():
     """Parses command-line arguments and launches the VM."""
     parser = argparse.ArgumentParser(
         description="Launch a QEMU AArch64 virtual machine with fully independent display and firmware options.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog="""
+Directory Sharing:
+  Use --share-dir to share a host directory with the guest via VirtFS (9P).
+
+  Example: --share-dir /Users/myuser/projects:hostshare
+
+  Inside the guest, mount with:
+    sudo mkdir -p /mnt/hostshare
+    sudo mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/hostshare
+
+  To make it persistent, add to /etc/fstab in the guest:
+    hostshare  /mnt/hostshare  9p  trans=virtio,version=9p2000.L,_netdev  0  0
+
+  Note: Guest kernel must have 9P filesystem support (CONFIG_9P_FS).
+        """
     )
 
     # --- Argument Definitions ---
@@ -702,6 +798,11 @@ def main():
     parser.add_argument(
         "--console", choices=['gui', 'text'], default='gui',
         help="Choose the console type. 'gui' for a graphical window, 'text' for an integrated serial console with key translation."
+    )
+    parser.add_argument(
+        "--share-dir",
+        help="Share a host directory with the guest. Format: /host/path:mount_tag (e.g., /Users/me/data:hostshare). "
+             "Mount in guest with: sudo mount -t 9p -o trans=virtio mount_tag /mnt/mountpoint"
     )
 
     # Executable paths
