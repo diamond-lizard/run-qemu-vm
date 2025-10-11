@@ -15,8 +15,8 @@
 #      ./run-qemu-vm.py --architecture aarch64 --disk-image my-os.qcow2 --cdrom uefi-installer.iso --console gui
 #
 #   3. UEFI installation with a text-only terminal (x86_64):
-#      ./run-qemu-vm.py --architecture x86_64 --disk-image my-x86.qcow2 --cdrom ubuntu.iso --console text
-#      # Script provides integrated terminal with working arrow keys and backspace
+#      ./run-qemu-vm.py --architecture x86_64 --disk-image my-x86.qcow2 --cdrom alpine-virt.iso --console text
+#      # Script forces BIOS boot for x86 text mode to use serial-friendly bootloaders.
 #      # Press Ctrl-] for control menu
 #
 #   4. Share a directory with the guest:
@@ -28,7 +28,7 @@
 #
 # Prerequisites:
 #   - QEMU must be installed (e.g., via `brew install qemu`).
-#   - For BIOS/serial installations, '7z' must be in the PATH (from 'p7zip').
+#   - For automated UEFI boot on simple ISOs, '7z' must be in the PATH.
 #   - For directory sharing, guest kernel must have 9P support (CONFIG_9P_FS).
 #
 
@@ -371,19 +371,31 @@ def build_qemu_args(config):
             args.extend(["-virtfs", f"local,path={host_path},mount_tag={mount_tag},security_model={VIRTFS_SECURITY_MODEL},id={mount_tag}"])
         else: sys.exit(1)
 
-    # --- Firmware Selection ---
-    # Default to UEFI, but switch to BIOS for x86 text mode as it's more likely to have serial-by-default bootloaders.
-    is_x86_text_mode = config['console'] == 'text' and config['architecture'] in ['x86_64', 'i386']
+    # --- Firmware Selection Logic ---
+    # The user can override automatic selection with --firmware.
+    # Otherwise, for x86 text mode, we force a BIOS boot to find serial-friendly
+    # bootloaders (like on Alpine 'virt' ISOs).
+    # For all other cases, we default to UEFI if available.
+    use_uefi = True
+    if config['firmware'] == 'bios':
+        use_uefi = False
+        print("Info: User explicitly selected Legacy BIOS boot.")
+    elif config['firmware'] == 'uefi':
+        use_uefi = True
+        print("Info: User explicitly selected UEFI boot.")
+    elif config['console'] == 'text' and config['architecture'] in ['x86_64', 'i386']:
+        use_uefi = False
+        print("Info: Forcing Legacy BIOS boot for x86 text mode to find serial-friendly bootloader.")
 
-    if config['firmware'] == 'uefi' and not is_x86_text_mode:
-        if config.get('uefi_code') and config.get('uefi_vars'):
-            print("Info: Using UEFI boot.")
-            args.extend(["-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}", "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}"])
+    if use_uefi and config.get('uefi_code') and config.get('uefi_vars'):
+        print("Info: Using UEFI boot.")
+        args.extend(["-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}", "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}"])
+    elif not use_uefi:
+        # This branch is hit for BIOS mode (either forced or explicit)
+        pass # No extra arguments needed for BIOS
     else:
-        if is_x86_text_mode:
-            print("Info: Forcing Legacy BIOS boot for x86 text mode to enable serial console.")
-        else:
-            print("Info: Using Legacy BIOS boot.")
+        # This branch is hit if UEFI was desired but firmware files are missing.
+        print("Warning: UEFI boot was intended but firmware files are missing. Defaulting to Legacy BIOS.")
 
     if config['console'] == 'text':
         monitor_socket = f"/tmp/qemu-monitor-{os.getpid()}.sock"
@@ -403,7 +415,7 @@ def build_qemu_args(config):
     args.extend(["-boot", f"order={boot_order}"])
 
     # --- Smart Boot Automation (for UEFI GUI mode) ---
-    if boot_order == 'd' and config["cdrom"] and config['firmware'] == 'uefi' and not is_x86_text_mode:
+    if use_uefi and boot_order == 'd' and config["cdrom"]:
         boot_strategy = inspect_iso_for_boot_strategy(config['seven_zip_executable'], config['cdrom'])
         if boot_strategy == 'direct_efi_boot':
             create_and_run_uefi_with_automation(args, config)
@@ -458,11 +470,11 @@ def main():
     parser.add_argument("--architecture", required=True, help="QEMU system architecture (e.g., aarch64, x86_64). Use 'list' for options.")
     parser.add_argument("--disk-image", help="Path to the primary virtual hard disk image (.qcow2).")
     parser.add_argument("--cdrom", help="Path to a bootable ISO file.")
-    parser.add_argument("--boot-from", choices=['cdrom', 'hd'], help="Specify boot device for UEFI mode.")
-    parser.add_argument("--firmware", choices=['uefi', 'bios'], help="Specify firmware mode.")
-    parser.add_argument("--console", choices=['gui', 'text'], default='gui', help="Console type.")
+    parser.add_argument("--boot-from", choices=['cdrom', 'hd'], help="Specify boot device. Defaults to 'cdrom' if --cdrom is used.")
+    parser.add_argument("--firmware", choices=['uefi', 'bios'], help="Force a specific firmware mode, overriding automatic selection.")
+    parser.add_argument("--console", choices=['gui', 'text'], default='gui', help="Console type. Defaults to 'gui'.")
     parser.add_argument("--share-dir", metavar="/HOST/PATH:MOUNT_TAG", help="Share a host directory with the guest via VirtFS.")
-    parser.add_argument("--serial-device", help="Serial device profile. Use 'list' to see options for the selected architecture.")
+    parser.add_argument("--serial-device", help="Serial device profile for text mode. Use 'list' to see options.")
 
     parser.add_argument("--machine-type", default=MACHINE_TYPE, help="QEMU machine type.")
     parser.add_argument("--accelerator", default=ACCELERATOR, help="VM accelerator (e.g., hvf, kvm, tcg). Default: auto-detected.")
@@ -516,20 +528,23 @@ def main():
     if not os.path.exists(config["disk_image"]): print(f"Error: Disk image not found: {config['disk_image']}", file=sys.stderr); sys.exit(1)
     if config["cdrom"] and not os.path.exists(config["cdrom"]): print(f"Error: CD-ROM image not found: {config['cdrom']}", file=sys.stderr); sys.exit(1)
 
-    config['firmware'] = config.get('firmware') or detect_firmware_type(config.get('cdrom'), config['architecture'])
+    # If --firmware is not set, detect it. This is just a preliminary check.
+    # The final decision is made in build_qemu_args based on console mode.
+    if not config.get('firmware'):
+        config['firmware'] = detect_firmware_type(config.get('cdrom'), config['architecture'])
+
     if config['architecture'] == 'x86_64' and config['machine_type'] == 'virt': config['machine_type'] = 'q35'
 
-    if config['firmware'] == 'uefi':
-        fw_map = {'aarch64': 'edk2-aarch64-code.fd', 'x86_64': 'edk2-x86_64-code.fd', 'riscv64': 'edk2-riscv64-code.fd'}
-        if (fw_filename := fw_map.get(config['architecture'])):
-            qemu_prefix = get_qemu_prefix(config['brew_executable'])
-            if not config["uefi_code_path"]: config["uefi_code_path"] = str(qemu_prefix / "share/qemu" / fw_filename)
-            if not config["uefi_vars_path"]:
-                disk_path = Path(config["disk_image"])
-                config["uefi_vars_path"] = str(disk_path.parent / f"{disk_path.stem}-{config['architecture']}-vars.fd")
-            if os.path.exists(config["uefi_code_path"]): prepare_uefi_vars_file(config["uefi_vars_path"], config["uefi_code_path"])
-            else: print(f"Warning: UEFI firmware '{fw_filename}' not found. Disabling UEFI.", file=sys.stderr); config['firmware'] = 'bios'
-        else: print(f"Info: No standard UEFI for '{config['architecture']}'. Assuming BIOS.", file=sys.stderr); config['firmware'] = 'bios'
+    # Prepare UEFI paths regardless of final decision, in case they are needed.
+    fw_map = {'aarch64': 'edk2-aarch64-code.fd', 'x86_64': 'edk2-x86_64-code.fd', 'riscv64': 'edk2-riscv64-code.fd'}
+    if (fw_filename := fw_map.get(config['architecture'])):
+        qemu_prefix = get_qemu_prefix(config['brew_executable'])
+        if not config["uefi_code_path"]: config["uefi_code_path"] = str(qemu_prefix / "share/qemu" / fw_filename)
+        if not config["uefi_vars_path"]:
+            disk_path = Path(config["disk_image"])
+            config["uefi_vars_path"] = str(disk_path.parent / f"{disk_path.stem}-{config['architecture']}-vars.fd")
+        if os.path.exists(config["uefi_code_path"]): prepare_uefi_vars_file(config["uefi_vars_path"], config["uefi_code_path"])
+        else: print(f"Warning: UEFI firmware '{fw_filename}' not found. UEFI boot is not possible.", file=sys.stderr)
 
     # Rename for consistency before passing to build_qemu_args
     config['uefi_code'] = config.pop('uefi_code_path', None)
