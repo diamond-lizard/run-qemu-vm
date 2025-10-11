@@ -376,16 +376,25 @@ def build_qemu_args(config):
         args.extend(serial_args)
         args.append("-nographic")
     else: # gui
-        gfx = config['graphics_device'] or ('virtio-gpu-pci' if config['architecture'] in ['x86_64', 'aarch64'] else 'VGA')
+        # --- Graphics Device Selection ---
+        # Default to a standard VGA card for x86 for maximum compatibility with bootloaders.
+        # Use virtio-gpu for other modern architectures where drivers are common.
+        gfx = config['graphics_device']
+        if not gfx:
+            if config['architecture'] in ['x86_64', 'i386']:
+                gfx = 'std' # Standard VGA card, most compatible
+            elif config['architecture'] == 'aarch64':
+                gfx = 'virtio-gpu-pci' # High-performance paravirtualized GPU
+            else:
+                gfx = 'VGA' # Generic fallback
+        print(f"Info: Using graphics device '{gfx}'.")
         args.extend(["-device", gfx, "-display", config["display_type"], "-device", config["keyboard_device"], "-device", config["mouse_device"]])
 
     boot_order = 'd' if config.get("boot_from") == 'cdrom' or (not config.get("boot_from") and config["cdrom"]) else 'c'
     args.extend(["-boot", f"order={boot_order}"])
 
-    # --- Smart Boot Automation (for UEFI GUI mode) ---
+    # --- Smart Boot Automation (for UEFI mode) ---
     if use_uefi and boot_order == 'd' and config["cdrom"]:
-        # Re-enable aggressive boot automation for UEFI as the default,
-        # as deferring to GRUB has proven unreliable for some ISOs.
         create_and_run_uefi_with_automation(args, config)
     else:
         run_qemu(args, config)
@@ -404,14 +413,9 @@ def prepare_uefi_vars_file(vars_path, code_path):
 
 def run_qemu(args, config):
     """Executes the QEMU command and handles text console if needed."""
-    # --- Corrected Command Line Logging ---
     print("--- Starting QEMU with the following command ---", flush=True)
-    # Use subprocess.list2cmdline for a copy-paste friendly version, but also print list for clarity
+    # Use subprocess.list2cmdline for a copy-paste friendly version
     print(subprocess.list2cmdline(args), flush=True)
-    # For very long command lines, print one argument per line for guaranteed visibility
-    # print("--- Arguments List ---")
-    # for arg in args:
-    #     print(f"  {arg}")
     print("-" * 50, flush=True)
 
     try:
@@ -456,10 +460,12 @@ def main():
     parser.add_argument("--cpu-model", default=CPU_MODEL, help="CPU model to emulate.")
     parser.add_argument("--memory", default=MEMORY, help="RAM for the VM.")
     parser.add_argument("--smp-cores", type=int, default=SMP_CORES, help="Number of CPU cores.")
+    parser.add_argument("--graphics-device", default=GRAPHICS_DEVICE, help="Virtual graphics device (e.g., virtio-gpu-pci, std, VGA).")
+
     # Suppressed from help as they are auto-detected or internal
     suppressed_args = {
         "qemu_executable": QEMU_EXECUTABLE, "seven_zip_executable": SEVEN_ZIP_EXECUTABLE, "brew_executable": BREW_EXECUTABLE,
-        "uefi_code_path": UEFI_CODE_PATH, "uefi_vars_path": UEFI_VARS_PATH, "graphics_device": GRAPHICS_DEVICE,
+        "uefi_code_path": UEFI_CODE_PATH, "uefi_vars_path": UEFI_VARS_PATH,
         "display_type": DISPLAY_TYPE, "usb_controller": USB_CONTROLLER, "keyboard_device": KEYBOARD_DEVICE,
         "mouse_device": MOUSE_DEVICE, "network_backend": NETWORK_BACKEND, "network_device": NETWORK_DEVICE
     }
@@ -514,7 +520,6 @@ def main():
             disk_path = Path(config["disk_image"])
             config["uefi_vars_path"] = str(disk_path.parent / f"{disk_path.stem}-{config['architecture']}-vars.fd")
         if os.path.exists(config["uefi_code_path"]): prepare_uefi_vars_file(config["uefi_vars_path"], config["uefi_code_path"])
-        # No 'else' here; we check for existence in build_qemu_args
 
     # Rename for consistency before passing to build_qemu_args
     config['uefi_code'] = config.pop('uefi_code_path', None)
