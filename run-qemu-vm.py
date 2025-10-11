@@ -377,18 +377,23 @@ def build_qemu_args(config):
         args.append("-nographic")
     else: # gui
         # --- Graphics Device Selection ---
-        # Default to a standard VGA card for x86 for maximum compatibility with bootloaders.
-        # Use virtio-gpu for other modern architectures where drivers are common.
-        gfx = config['graphics_device']
-        if not gfx:
+        vga_type = config.get('vga_type')
+        if not vga_type:
             if config['architecture'] in ['x86_64', 'i386']:
-                gfx = 'std' # Standard VGA card, most compatible
+                vga_type = 'std'  # Standard VGA card, most compatible
             elif config['architecture'] == 'aarch64':
-                gfx = 'virtio-gpu-pci' # High-performance paravirtualized GPU
+                # For ARM, virtio-gpu-pci is a device, not a -vga type.
+                # We add it as a separate device.
+                args.extend(["-device", "virtio-gpu-pci"])
+                vga_type = 'none' # Avoids QEMU adding a default VGA device
             else:
-                gfx = 'VGA' # Generic fallback
-        print(f"Info: Using graphics device '{gfx}'.")
-        args.extend(["-device", gfx, "-display", config["display_type"], "-device", config["keyboard_device"], "-device", config["mouse_device"]])
+                vga_type = 'std' # Generic fallback
+
+        if vga_type != 'none':
+            print(f"Info: Using VGA type '{vga_type}'.")
+            args.extend(["-vga", vga_type])
+
+        args.extend(["-display", config["display_type"], "-device", config["keyboard_device"], "-device", config["mouse_device"]])
 
     boot_order = 'd' if config.get("boot_from") == 'cdrom' or (not config.get("boot_from") and config["cdrom"]) else 'c'
     args.extend(["-boot", f"order={boot_order}"])
@@ -460,7 +465,7 @@ def main():
     parser.add_argument("--cpu-model", default=CPU_MODEL, help="CPU model to emulate.")
     parser.add_argument("--memory", default=MEMORY, help="RAM for the VM.")
     parser.add_argument("--smp-cores", type=int, default=SMP_CORES, help="Number of CPU cores.")
-    parser.add_argument("--graphics-device", default=GRAPHICS_DEVICE, help="Virtual graphics device (e.g., virtio-gpu-pci, std, VGA).")
+    parser.add_argument("--vga-type", default=None, help="QEMU VGA card type (e.g., std, virtio, qxl). Overrides automatic selection.")
 
     # Suppressed from help as they are auto-detected or internal
     suppressed_args = {
