@@ -180,39 +180,6 @@ def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
     print(f"Warning: Could not find a suitable bootloader ({', '.join(patterns)}) in the ISO.", file=sys.stderr)
     return None, None
 
-def inspect_iso_for_boot_strategy(seven_zip_executable, iso_path):
-    """
-    Inspects the ISO file listing to determine the best boot strategy.
-    Returns 'trust_firmware' for complex bootloaders (like GRUB) or
-    'direct_efi_boot' for simpler cases.
-    """
-    if not iso_path:
-        return 'direct_efi_boot' # No ISO, so doesn't matter
-
-    print(f"Info: Inspecting ISO '{Path(iso_path).name}' for bootloader configuration...")
-    try:
-        result = subprocess.run([seven_zip_executable, 'l', iso_path], capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore')
-    except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        print(f"Warning: Could not inspect ISO. Defaulting to firmware boot. Error: {e}", file=sys.stderr)
-        return 'trust_firmware'
-
-    # Clues that indicate a complex bootloader that should be trusted
-    complex_boot_clues = [
-        'boot/grub/grub.cfg',
-        'isolinux/syslinux.cfg',
-        'boot/syslinux/syslinux.cfg',
-    ]
-
-    iso_content = result.stdout.lower()
-    for clue in complex_boot_clues:
-        if clue in iso_content:
-            print(f"Info: Found '{clue}'. Recommending 'trust_firmware' boot strategy.")
-            return 'trust_firmware'
-
-    print("Info: No complex bootloader config found. Recommending 'direct_efi_boot' strategy.")
-    return 'direct_efi_boot'
-
-
 def parse_share_dir_argument(share_dir_arg):
     """Parse and validate the --share-dir argument."""
     if not share_dir_arg: return None, None
@@ -372,10 +339,6 @@ def build_qemu_args(config):
         else: sys.exit(1)
 
     # --- Firmware Selection Logic ---
-    # 1. Honor explicit user choice first.
-    # 2. If no choice, apply automatic logic:
-    #    - Force BIOS for x86 text mode to find serial-friendly bootloaders.
-    #    - Default to UEFI for all other cases.
     use_uefi = None
     if config.get('firmware') == 'bios':
         use_uefi = False
@@ -384,24 +347,22 @@ def build_qemu_args(config):
         use_uefi = True
         print("Info: User explicitly selected UEFI boot.")
     else:
-        # Automatic selection logic
         if config['console'] == 'text' and config['architecture'] in ['x86_64', 'i386']:
             use_uefi = False
             print("Info: Forcing Legacy BIOS boot for x86 text mode to find serial-friendly bootloader.")
         else:
-            # Default for GUI, ARM, etc.
             use_uefi = True
 
     if use_uefi:
-        if config.get('uefi_code') and config.get('uefi_vars'):
+        if config.get('uefi_code') and os.path.exists(config['uefi_code']):
             print("Info: Using UEFI boot.")
             args.extend(["-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}", "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}"])
         else:
-            print("Warning: UEFI boot was intended but firmware files are missing. Defaulting to Legacy BIOS.")
-            use_uefi = False # Update flag to reflect reality
-
-    if not use_uefi and not config.get('firmware') == 'bios':
-        # This log is for when we fall back to BIOS either automatically or due to missing files
+            print("Error: UEFI boot was selected, but UEFI firmware is not found.", file=sys.stderr)
+            if config.get('uefi_code'): print(f"       Attempted path: {config['uefi_code']}", file=sys.stderr)
+            print("       Please install QEMU's UEFI firmware files (e.g., 'edk2-qemu') or specify '--firmware bios'.", file=sys.stderr)
+            sys.exit(1)
+    else:
         print("Info: Using Legacy BIOS boot.")
 
     if config['console'] == 'text':
@@ -423,11 +384,9 @@ def build_qemu_args(config):
 
     # --- Smart Boot Automation (for UEFI GUI mode) ---
     if use_uefi and boot_order == 'd' and config["cdrom"]:
-        boot_strategy = inspect_iso_for_boot_strategy(config['seven_zip_executable'], config['cdrom'])
-        if boot_strategy == 'direct_efi_boot':
-            create_and_run_uefi_with_automation(args, config)
-        else:
-            run_qemu(args, config)
+        # Re-enable aggressive boot automation for UEFI as the default,
+        # as deferring to GRUB has proven unreliable for some ISOs.
+        create_and_run_uefi_with_automation(args, config)
     else:
         run_qemu(args, config)
 
@@ -445,7 +404,16 @@ def prepare_uefi_vars_file(vars_path, code_path):
 
 def run_qemu(args, config):
     """Executes the QEMU command and handles text console if needed."""
-    print("--- Starting QEMU with the following command ---\n" + subprocess.list2cmdline(args) + "\n" + "-"*50, flush=True)
+    # --- Corrected Command Line Logging ---
+    print("--- Starting QEMU with the following command ---", flush=True)
+    # Use subprocess.list2cmdline for a copy-paste friendly version, but also print list for clarity
+    print(subprocess.list2cmdline(args), flush=True)
+    # For very long command lines, print one argument per line for guaranteed visibility
+    # print("--- Arguments List ---")
+    # for arg in args:
+    #     print(f"  {arg}")
+    print("-" * 50, flush=True)
+
     try:
         if config.get('console') == 'text':
             process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -546,7 +514,7 @@ def main():
             disk_path = Path(config["disk_image"])
             config["uefi_vars_path"] = str(disk_path.parent / f"{disk_path.stem}-{config['architecture']}-vars.fd")
         if os.path.exists(config["uefi_code_path"]): prepare_uefi_vars_file(config["uefi_vars_path"], config["uefi_code_path"])
-        else: print(f"Warning: UEFI firmware '{fw_filename}' not found. UEFI boot is not possible.", file=sys.stderr)
+        # No 'else' here; we check for existence in build_qemu_args
 
     # Rename for consistency before passing to build_qemu_args
     config['uefi_code'] = config.pop('uefi_code_path', None)
