@@ -372,30 +372,37 @@ def build_qemu_args(config):
         else: sys.exit(1)
 
     # --- Firmware Selection Logic ---
-    # The user can override automatic selection with --firmware.
-    # Otherwise, for x86 text mode, we force a BIOS boot to find serial-friendly
-    # bootloaders (like on Alpine 'virt' ISOs).
-    # For all other cases, we default to UEFI if available.
-    use_uefi = True
-    if config['firmware'] == 'bios':
+    # 1. Honor explicit user choice first.
+    # 2. If no choice, apply automatic logic:
+    #    - Force BIOS for x86 text mode to find serial-friendly bootloaders.
+    #    - Default to UEFI for all other cases.
+    use_uefi = None
+    if config.get('firmware') == 'bios':
         use_uefi = False
         print("Info: User explicitly selected Legacy BIOS boot.")
-    elif config['firmware'] == 'uefi':
+    elif config.get('firmware') == 'uefi':
         use_uefi = True
         print("Info: User explicitly selected UEFI boot.")
-    elif config['console'] == 'text' and config['architecture'] in ['x86_64', 'i386']:
-        use_uefi = False
-        print("Info: Forcing Legacy BIOS boot for x86 text mode to find serial-friendly bootloader.")
-
-    if use_uefi and config.get('uefi_code') and config.get('uefi_vars'):
-        print("Info: Using UEFI boot.")
-        args.extend(["-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}", "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}"])
-    elif not use_uefi:
-        # This branch is hit for BIOS mode (either forced or explicit)
-        pass # No extra arguments needed for BIOS
     else:
-        # This branch is hit if UEFI was desired but firmware files are missing.
-        print("Warning: UEFI boot was intended but firmware files are missing. Defaulting to Legacy BIOS.")
+        # Automatic selection logic
+        if config['console'] == 'text' and config['architecture'] in ['x86_64', 'i386']:
+            use_uefi = False
+            print("Info: Forcing Legacy BIOS boot for x86 text mode to find serial-friendly bootloader.")
+        else:
+            # Default for GUI, ARM, etc.
+            use_uefi = True
+
+    if use_uefi:
+        if config.get('uefi_code') and config.get('uefi_vars'):
+            print("Info: Using UEFI boot.")
+            args.extend(["-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}", "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}"])
+        else:
+            print("Warning: UEFI boot was intended but firmware files are missing. Defaulting to Legacy BIOS.")
+            use_uefi = False # Update flag to reflect reality
+
+    if not use_uefi and not config.get('firmware') == 'bios':
+        # This log is for when we fall back to BIOS either automatically or due to missing files
+        print("Info: Using Legacy BIOS boot.")
 
     if config['console'] == 'text':
         monitor_socket = f"/tmp/qemu-monitor-{os.getpid()}.sock"
@@ -528,14 +535,9 @@ def main():
     if not os.path.exists(config["disk_image"]): print(f"Error: Disk image not found: {config['disk_image']}", file=sys.stderr); sys.exit(1)
     if config["cdrom"] and not os.path.exists(config["cdrom"]): print(f"Error: CD-ROM image not found: {config['cdrom']}", file=sys.stderr); sys.exit(1)
 
-    # If --firmware is not set, detect it. This is just a preliminary check.
-    # The final decision is made in build_qemu_args based on console mode.
-    if not config.get('firmware'):
-        config['firmware'] = detect_firmware_type(config.get('cdrom'), config['architecture'])
-
     if config['architecture'] == 'x86_64' and config['machine_type'] == 'virt': config['machine_type'] = 'q35'
 
-    # Prepare UEFI paths regardless of final decision, in case they are needed.
+    # Prepare UEFI paths so they are available for build_qemu_args if needed.
     fw_map = {'aarch64': 'edk2-aarch64-code.fd', 'x86_64': 'edk2-x86_64-code.fd', 'riscv64': 'edk2-riscv64-code.fd'}
     if (fw_filename := fw_map.get(config['architecture'])):
         qemu_prefix = get_qemu_prefix(config['brew_executable'])
