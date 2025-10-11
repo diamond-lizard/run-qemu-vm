@@ -45,7 +45,6 @@ import termios
 import tty
 import socket
 import time
-import signal
 import threading
 import platform
 
@@ -372,8 +371,19 @@ def build_qemu_args(config):
             args.extend(["-virtfs", f"local,path={host_path},mount_tag={mount_tag},security_model={VIRTFS_SECURITY_MODEL},id={mount_tag}"])
         else: sys.exit(1)
 
-    if config['firmware'] == 'uefi' and config.get('uefi_code') and config.get('uefi_vars'):
-        args.extend(["-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}", "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}"])
+    # --- Firmware Selection ---
+    # Default to UEFI, but switch to BIOS for x86 text mode as it's more likely to have serial-by-default bootloaders.
+    is_x86_text_mode = config['console'] == 'text' and config['architecture'] in ['x86_64', 'i386']
+
+    if config['firmware'] == 'uefi' and not is_x86_text_mode:
+        if config.get('uefi_code') and config.get('uefi_vars'):
+            print("Info: Using UEFI boot.")
+            args.extend(["-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}", "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}"])
+    else:
+        if is_x86_text_mode:
+            print("Info: Forcing Legacy BIOS boot for x86 text mode to enable serial console.")
+        else:
+            print("Info: Using Legacy BIOS boot.")
 
     if config['console'] == 'text':
         monitor_socket = f"/tmp/qemu-monitor-{os.getpid()}.sock"
@@ -392,62 +402,13 @@ def build_qemu_args(config):
     boot_order = 'd' if config.get("boot_from") == 'cdrom' or (not config.get("boot_from") and config["cdrom"]) else 'c'
     args.extend(["-boot", f"order={boot_order}"])
 
-    # --- Smart Boot Automation ---
-    if boot_order == 'd' and config["cdrom"]:
-        # For text mode on x86, the most reliable method is to boot the kernel directly.
-        if config['console'] == 'text' and config['architecture'] in ['x86_64', 'i386']:
-            print("Info: Using direct kernel boot for x86 text console.")
-            with tempfile.TemporaryDirectory(prefix="qemu-kernel-boot-") as temp_dir:
-                try:
-                    print("Info: Extracting kernel and initrd from ISO...")
-                    # Extract vmlinuz and initrd from the /boot directory of the ISO
-                    subprocess.run([config["seven_zip_executable"], "e", config["cdrom"], "boot/vmlinuz-*", "boot/initramfs-*", f"-o{temp_dir}"], check=True, capture_output=True)
-
-                    kernel_path = next(Path(temp_dir).glob("vmlinuz-*"), None)
-                    initrd_path = next(Path(temp_dir).glob("initramfs-*"), None)
-
-                    if not kernel_path or not initrd_path:
-                        print("Error: Could not find kernel or initrd in ISO /boot directory.", file=sys.stderr)
-                        sys.exit(1)
-
-                    print(f"Info: Found kernel: {kernel_path.name}")
-                    print(f"Info: Found initrd: {initrd_path.name}")
-
-                    # --- Robustly filter arguments for direct kernel boot ---
-                    final_args = []
-                    i = 0
-                    while i < len(args):
-                        arg = args[i]
-                        # Flags with one value to skip (and their values)
-                        if arg in ['-boot']:
-                            i += 2 # Skip flag and its value
-                            continue
-                        # Skip UEFI drive args
-                        if arg == '-drive' and 'pflash' in args[i+1]:
-                            i += 2 # Skip flag and its value
-                            continue
-                        final_args.append(arg)
-                        i += 1
-
-                    final_args.extend([
-                        "-kernel", str(kernel_path),
-                        "-initrd", str(initrd_path),
-                        "-append", "console=ttyS0" # Tell Linux kernel to use serial port
-                    ])
-                    run_qemu(final_args, config)
-                    return # Exit after starting qemu
-                except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                    print(f"Error during kernel extraction: {e}", file=sys.stderr)
-                    if hasattr(e, 'stderr'): print(e.stderr.decode(), file=sys.stderr)
-                    print("Falling back to standard UEFI boot.", file=sys.stderr)
-                    run_qemu(args, config) # Fallback to standard boot
+    # --- Smart Boot Automation (for UEFI GUI mode) ---
+    if boot_order == 'd' and config["cdrom"] and config['firmware'] == 'uefi' and not is_x86_text_mode:
+        boot_strategy = inspect_iso_for_boot_strategy(config['seven_zip_executable'], config['cdrom'])
+        if boot_strategy == 'direct_efi_boot':
+            create_and_run_uefi_with_automation(args, config)
         else:
-             # For GUI mode or other architectures, use the UEFI firmware
-            boot_strategy = inspect_iso_for_boot_strategy(config['seven_zip_executable'], config['cdrom'])
-            if boot_strategy == 'direct_efi_boot':
-                create_and_run_uefi_with_automation(args, config)
-            else: # trust_firmware
-                run_qemu(args, config)
+            run_qemu(args, config)
     else:
         run_qemu(args, config)
 
