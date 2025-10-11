@@ -424,8 +424,12 @@ def prepare_uefi_vars_file(vars_path, code_path):
 def run_qemu(args, config):
     """Executes the QEMU command and handles text console if needed."""
     print("--- Starting QEMU with the following command ---", flush=True)
-    # Use subprocess.list2cmdline for a copy-paste friendly version
-    print(subprocess.list2cmdline(args), flush=True)
+    # Format the command for readability, with each argument on a new line.
+    # The first argument is the command itself, followed by indented arguments.
+    # This mimics a shell script format for easy copying and understanding.
+    formatted_command = f"{args[0]} \\\n"
+    formatted_command += " \\\n".join([f"    {subprocess.list2cmdline([arg])}" for arg in args[1:]])
+    print(formatted_command, flush=True)
     print("-" * 50, flush=True)
 
     try:
