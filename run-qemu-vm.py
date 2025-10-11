@@ -347,9 +347,14 @@ def build_qemu_args(config):
         use_uefi = True
         print("Info: User explicitly selected UEFI boot.")
     else:
-        if config['console'] == 'text' and config['architecture'] in ['x86_64', 'i386']:
+        # Automatic selection logic
+        is_x86 = config['architecture'] in ['x86_64', 'i386']
+        if is_x86 and config['console'] == 'text':
             use_uefi = False
-            print("Info: Forcing Legacy BIOS boot for x86 text mode to find serial-friendly bootloader.")
+            print("Info: Forcing Legacy BIOS for x86 text mode to find serial-friendly bootloader.")
+        elif is_x86 and config['console'] == 'gui' and sys.platform == "darwin":
+            use_uefi = False
+            print("Info: Forcing Legacy BIOS for x86 GUI mode on macOS to avoid UEFI display errors.")
         else:
             use_uefi = True
 
