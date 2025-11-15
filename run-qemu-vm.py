@@ -50,6 +50,9 @@ import socket
 import time
 import threading
 import platform
+import fcntl
+import signal
+import struct
 
 # --- Global Configuration & Executable Paths ---
 
@@ -109,11 +112,11 @@ SERIAL_DEVICE_PROFILES = {
 }
 
 ARCH_DEFAULT_SERIAL = {
-    "x86_64": "pc",
-    "i386": "pc",
-    "aarch64": "pl011",
-    "riscv64": "pl011", # The 'virt' machine for RISC-V also uses a PL011-compatible UART
-    "default": "pl011"
+    "x86_64": "virtio",
+    "i386": "virtio",
+    "aarch64": "virtio",
+    "riscv64": "virtio",
+    "default": "pl011" # Fallback for other arches
 }
 
 
@@ -382,7 +385,11 @@ def add_direct_kernel_boot_args(base_args, config, kernel_file, initrd_file):
         args.pop(cdrom_index)
 
     # 2. Add the direct boot arguments
-    kernel_cmd_line = "console=ttyS0,115200n8 panic=1"
+    serial_profile_key = config.get("serial_device") or ARCH_DEFAULT_SERIAL.get(config['architecture'], ARCH_DEFAULT_SERIAL['default'])
+    if serial_profile_key == 'virtio':
+        kernel_cmd_line = "console=hvc0 panic=1"
+    else:
+        kernel_cmd_line = "console=ttyS0,115200n8 panic=1"
 
     if platform.system() == 'Linux':
         with tempfile.TemporaryDirectory(prefix="qemu-kernel-") as temp_dir:
@@ -448,7 +455,6 @@ def add_direct_kernel_boot_args(base_args, config, kernel_file, initrd_file):
             config['monitor_socket'] = monitor_socket
             args.extend(["-monitor", f"unix:{monitor_socket},server,nowait", "-chardev", "pty,id=char0"])
 
-            serial_profile_key = config.get("serial_device") or ARCH_DEFAULT_SERIAL.get(config['architecture'], ARCH_DEFAULT_SERIAL['default'])
             serial_args = SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
             print(f"Info: Using '{serial_profile_key}' serial profile for Direct Kernel Boot.")
             args.extend(serial_args)
@@ -472,7 +478,6 @@ def add_direct_kernel_boot_args(base_args, config, kernel_file, initrd_file):
         config['monitor_socket'] = monitor_socket
         args.extend(["-monitor", f"unix:{monitor_socket},server,nowait", "-chardev", "pty,id=char0"])
 
-        serial_profile_key = config.get("serial_device") or ARCH_DEFAULT_SERIAL.get(config['architecture'], ARCH_DEFAULT_SERIAL['default'])
         serial_args = SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
         print(f"Info: Using '{serial_profile_key}' serial profile for Direct Kernel Boot.")
         args.extend(serial_args)
@@ -522,6 +527,15 @@ class TextConsoleManager:
         self.current_mode = MODE_SERIAL_CONSOLE
         self.stdin_fd, self.stdout_fd = sys.stdin.fileno(), sys.stdout.fileno()
 
+    def _handle_winch(self, signum, frame):
+        """SIGWINCH handler to propagate terminal resize to the PTY."""
+        try:
+            rows, cols = os.get_terminal_size(self.stdin_fd)
+            winsize = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(self.pty_fd, termios.TIOCSWINSZ, winsize)
+        except (OSError, AttributeError):
+            pass
+
     def setup(self):
         try:
             for i in range(20):
@@ -560,6 +574,10 @@ class TextConsoleManager:
             except BlockingIOError:
                 pass
 
+            # Register SIGWINCH handler to propagate terminal size changes.
+            signal.signal(signal.SIGWINCH, self._handle_winch)
+            self._handle_winch(None, None)  # Propagate initial size.
+
             self.original_settings = termios.tcgetattr(self.stdin_fd)
             tty.setraw(self.stdin_fd)
             print(f"\nConnected to serial console: {self.pty_device}\nPress Ctrl-] for control menu.\n", flush=True)
@@ -569,6 +587,7 @@ class TextConsoleManager:
             return False
 
     def restore_terminal(self):
+        signal.signal(signal.SIGWINCH, signal.SIG_DFL)
         if self.original_settings:
             termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN, self.original_settings)
 
