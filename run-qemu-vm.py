@@ -540,18 +540,24 @@ def main():
     if is_macos:
         config['qemu_executable'] = f"qemu-system-{config['architecture']}"
     else:  # Linux
-        # Try different executable name patterns commonly used in Linux distributions
-        possible_names = [
-            f"qemu-system-{config['architecture']}",  # Debian/Ubuntu style
-            f"qemu-{config['architecture']}"           # Other distros style
-        ]
+        # Only look for system emulators, skip user-mode emulators (qemu-*)
+        arch = config['architecture']
+        possible_names = [f"qemu-system-{arch}"]
 
+        # Add architecture variants for common naming schemes
+        if arch == 'x86_64':
+            possible_names.append("qemu-system-x86")  # Some distros use shorter names
+        elif arch == 'i386':
+            possible_names.append("qemu-system-i386")
+
+        # Always try the exact architecture name first
         for name in possible_names:
             if shutil.which(name):
                 config['qemu_executable'] = name
                 break
         else:
-            print(f"Error: Could not find QEMU executable for {config['architecture']}. Tried: {', '.join(possible_names)}", file=sys.stderr)
+            print(f"Error: Could not find SYSTEM QEMU executable for {arch}. Tried: {', '.join(possible_names)}", file=sys.stderr)
+            print("       Make sure you've installed the system emulator package (qemu-system-x86)", file=sys.stderr)
             sys.exit(1)
     host_arch, guest_arch = platform.machine(), config['architecture']
     is_native = (host_arch == 'arm64' and guest_arch == 'aarch64') or (host_arch == 'x86_64' and guest_arch == 'x86_64')
