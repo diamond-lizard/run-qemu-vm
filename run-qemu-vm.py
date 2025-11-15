@@ -218,8 +218,26 @@ def find_kernel_and_initrd(seven_zip_executable, iso_path):
     by searching for common file names (vmlinuz, initrd/initramfs) using
     isoinfo (preferred) or 7z.
     """
-    kernel_patterns = [r'vmlinuz', r'/boot/vmlinuz', r'boot/linux']
-    initrd_patterns = [r'initrd', r'initramfs', r'/boot/initrd', r'/boot/initramfs']
+    # Debian stores kernel in /boot/ with paths like: 
+    # /boot/vmlinuz and /boot/initrd.gz
+    # Different search patterns for Linux and macOS
+    if platform.system() == 'Linux':
+        # Linux-specific patterns focusing on Debian paths
+        kernel_patterns = [
+            r'/boot/vmlinuz$',  # Full path match for Debian
+            r'vmlinuz$',        # Fallback kernel name
+            r'boot/linux$'      # Alternative boot location
+        ]
+        initrd_patterns = [
+            r'/boot/initrd\.gz$',    # Debian initrd
+            r'/boot/initramfs\.gz$', # Other distros
+            r'initrd\.gz$',          # Fallback
+            r'initramfs\.gz$'        # Fallback
+        ]
+    else:
+        # Original macOS patterns unchanged
+        kernel_patterns = [r'vmlinuz', r'/boot/vmlinuz', r'boot/linux']
+        initrd_patterns = [r'initrd', r'initramfs', r'/boot/initrd', r'/boot/initramfs']
     found_kernel, found_initrd = None, None
     print(f"Info: Searching for kernel and initrd in '{iso_path}'...")
 
@@ -257,8 +275,12 @@ def find_kernel_and_initrd(seven_zip_executable, iso_path):
                     if found_kernel and found_initrd:
                         print(f"Info: Found Kernel: {found_kernel} (using isoinfo)")
                         print(f"Info: Found Initrd: {found_initrd} (using isoinfo)")
-                        # QEMU needs path relative to ISO root
-                        return found_kernel.lstrip('/'), found_initrd.lstrip('/')
+                        # On Linux we need full paths, on macOS the shorter paths work
+                        if platform.system() == 'Linux':
+                            return found_kernel, found_initrd
+                        else:
+                            # QEMU for macOS needs path relative to ISO root
+                            return found_kernel.lstrip('/'), found_initrd.lstrip('/')
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             tools_tried[-1] = f"isoinfo failed ({e})"
 
@@ -316,10 +338,18 @@ def add_direct_kernel_boot_args(base_args, config, kernel_file, initrd_file):
     # The crucial serial console argument is console=ttyS0,115200n8
     kernel_cmd_line = "console=ttyS0,115200n8 panic=1"
 
+    # For Linux QEMU, we need to specify absolute path within ISO using '/'
+    # macOS QEMU handles relative paths differently
+    iso_kernel_path = kernel_file
+    iso_initrd_path = initrd_file
+    if platform.system() == 'Linux':
+        iso_kernel_path = f"/{kernel_file}"
+        iso_initrd_path = f"/{initrd_file}"
+
     args.extend([
         # The 'iso:...' syntax tells QEMU to extract the file from the ISO image.
-        "-kernel", f"iso:{config['cdrom']}:{kernel_file}",
-        "-initrd", f"iso:{config['cdrom']}:{initrd_file}",
+        "-kernel", f"iso:{config['cdrom']}:{iso_kernel_path}",
+        "-initrd", f"iso:{config['cdrom']}:{iso_initrd_path}",
         "-append", kernel_cmd_line,
         "-nographic"
     ])
