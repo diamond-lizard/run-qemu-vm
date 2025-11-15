@@ -568,7 +568,12 @@ def main():
         else:
             config['accelerator'] = 'tcg'; print("Info: Auto-selected 'tcg' accelerator for emulation.")
 
-    if config['cpu_model'] == 'host' and not is_native:
+    # On Linux with TCG, always use 'max' CPU model regardless of architecture
+    if not is_macos and config['accelerator'] == 'tcg':
+        if config['cpu_model'] == 'host':
+            config['cpu_model'] = 'max'
+            print(f"Info: Forced 'max' CPU model for TCG emulation on Linux.")
+    elif config['cpu_model'] == 'host' and not is_native:
         config['cpu_model'] = 'max'; print(f"Info: Auto-selected CPU model '{config['cpu_model']}' for emulation.")
 
     if not os.path.exists(config["disk_image"]): print(f"Error: Disk image not found: {config['disk_image']}", file=sys.stderr); sys.exit(1)
