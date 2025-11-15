@@ -162,23 +162,51 @@ def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
     patterns = bootloader_patterns.get(architecture)
     if not patterns: return None, None
     print(f"Info: Searching for UEFI bootloader in '{iso_path}' for {architecture}...")
+    
+    tools_tried = []
+    is_macos = platform.system() == 'Darwin'
+    
+    # Prefer isoinfo on Linux
+    isoinfo_path = shutil.which("isoinfo")
+    if not is_macos and isoinfo_path:
+        try:
+            cmd = [isoinfo_path, '-i', iso_path, '-J', '-find', f'*/{patterns[0]}']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            if result.stdout.strip():
+                path_line = result.stdout.split('\n', 1)[0].strip()
+                if path_line:
+                    bootloader_full_path = path_line
+                    p = Path(bootloader_full_path)
+                    print(f"Info: Found UEFI bootloader: {p.name} at path {bootloader_full_path} using isoinfo")
+                    return p.name, str(p)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            tools_tried.append(f"isoinfo ({e})")
+    
+    # Fallback to 7z if available
     try:
         result = subprocess.run([seven_zip_executable, 'l', iso_path], capture_output=True, text=True, check=True)
     except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        print(f"Warning: Could not list files in ISO with '{seven_zip_executable}'. Error: {e}", file=sys.stderr)
+        tools_tried.append(f"7z ({e})")
+    else:
+        for line in result.stdout.splitlines():
+            for pattern in patterns:
+                if pattern in line.lower():
+                    parts = line.split()
+                    if len(parts) > 0 and parts[-1].lower().endswith(pattern):
+                        bootloader_full_path = parts[-1]
+                        p = Path(bootloader_full_path)
+                        print(f"Info: Found UEFI bootloader: {p.name} at path {bootloader_full_path} using 7z")
+                        return p.name, str(p).replace('/', '\\')
+        tools_tried.append("7z (no bootloader found)")
+    
+    # If we get here, no tool worked
+    if not is_macos:
+        print(f"Error: Could not extract from ISO. Tried: {', '.join(tools_tried)}", file=sys.stderr)
+        print("       Install either genisoimage/isoinfo or p7zip-full/7z.", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(f"Warning: Could not find a suitable bootloader ({', '.join(patterns)}) in the ISO. Tried: {', '.join(tools_tried)}", file=sys.stderr)
         return None, None
-
-    for line in result.stdout.splitlines():
-        for pattern in patterns:
-            if pattern in line.lower():
-                parts = line.split()
-                if len(parts) > 0 and parts[-1].lower().endswith(pattern):
-                    bootloader_full_path = parts[-1]
-                    p = Path(bootloader_full_path)
-                    print(f"Info: Found UEFI bootloader: {p.name} at path {bootloader_full_path}")
-                    return p.name, str(p).replace('/', '\\')
-    print(f"Warning: Could not find a suitable bootloader ({', '.join(patterns)}) in the ISO.", file=sys.stderr)
-    return None, None
 
 def parse_share_dir_argument(share_dir_arg):
     """Parse and validate the --share-dir argument."""
@@ -508,6 +536,7 @@ def main():
         print(f"Error: Unknown serial device profile '{args.serial_device}'. Use 'list' for options.", file=sys.stderr); sys.exit(1)
 
     config['qemu_executable'] = f"qemu-system-{config['architecture']}"
+    is_macos = platform.system() == 'Darwin'
     host_arch, guest_arch = platform.machine(), config['architecture']
     is_native = (host_arch == 'arm64' and guest_arch == 'aarch64') or (host_arch == 'x86_64' and guest_arch == 'x86_64')
 
@@ -528,12 +557,33 @@ def main():
     # Prepare UEFI paths so they are available for build_qemu_args if needed.
     fw_map = {'aarch64': 'edk2-aarch64-code.fd', 'x86_64': 'edk2-x86_64-code.fd', 'riscv64': 'edk2-riscv64-code.fd'}
     if (fw_filename := fw_map.get(config['architecture'])):
-        qemu_prefix = get_qemu_prefix(config['brew_executable'])
-        if not config["uefi_code_path"]: config["uefi_code_path"] = str(qemu_prefix / "share/qemu" / fw_filename)
+        if is_macos:
+            qemu_prefix = get_qemu_prefix(config['brew_executable'])
+            uefi_code = str(qemu_prefix / "share/qemu" / fw_filename)
+        else:  # Linux
+            # Try standard Linux paths
+            uefi_code = f"/usr/share/qemu/{fw_filename}"
+            if not os.path.exists(uefi_code): 
+                # Fallback to OVMF naming convention
+                if config['architecture'] == 'x86_64':
+                    uefi_code = "/usr/share/OVMF/OVMF_CODE.fd" 
+
+        if not config["uefi_code_path"]: 
+            config["uefi_code_path"] = uefi_code
+        
         if not config["uefi_vars_path"]:
             disk_path = Path(config["disk_image"])
             config["uefi_vars_path"] = str(disk_path.parent / f"{disk_path.stem}-{config['architecture']}-vars.fd")
-        if os.path.exists(config["uefi_code_path"]): prepare_uefi_vars_file(config["uefi_vars_path"], config["uefi_code_path"])
+        
+        if not os.path.exists(config["uefi_code_path"]):
+            print(f"Error: UEFI firmware file not found at: {config['uefi_code_path']}", file=sys.stderr)
+            if is_macos:
+                print("       Please install via: brew install edk2-qemu", file=sys.stderr)
+            else:
+                print("       Please install your distribution's UEFI package (e.g., ovmf, edk2)", file=sys.stderr)
+            sys.exit(1)
+        
+        prepare_uefi_vars_file(config["uefi_vars_path"], config["uefi_code_path"])
 
     # Rename for consistency before passing to build_qemu_args
     config['uefi_code'] = config.pop('uefi_code_path', None)
