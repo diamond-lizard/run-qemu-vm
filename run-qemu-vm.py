@@ -162,10 +162,10 @@ def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
     patterns = bootloader_patterns.get(architecture)
     if not patterns: return None, None
     print(f"Info: Searching for UEFI bootloader in '{iso_path}' for {architecture}...")
-    
+
     tools_tried = []
     is_macos = platform.system() == 'Darwin'
-    
+
     # Prefer isoinfo on Linux
     isoinfo_path = shutil.which("isoinfo")
     if not is_macos and isoinfo_path:
@@ -181,7 +181,7 @@ def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
                     return p.name, str(p)
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             tools_tried.append(f"isoinfo ({e})")
-    
+
     # Fallback to 7z if available
     try:
         result = subprocess.run([seven_zip_executable, 'l', iso_path], capture_output=True, text=True, check=True)
@@ -198,7 +198,7 @@ def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
                         print(f"Info: Found UEFI bootloader: {p.name} at path {bootloader_full_path} using 7z")
                         return p.name, str(p).replace('/', '\\')
         tools_tried.append("7z (no bootloader found)")
-    
+
     # If we get here, no tool worked
     if not is_macos:
         print(f"Error: Could not extract from ISO. Tried: {', '.join(tools_tried)}", file=sys.stderr)
@@ -535,8 +535,24 @@ def main():
     if args.serial_device and args.serial_device not in SERIAL_DEVICE_PROFILES:
         print(f"Error: Unknown serial device profile '{args.serial_device}'. Use 'list' for options.", file=sys.stderr); sys.exit(1)
 
-    config['qemu_executable'] = f"qemu-system-{config['architecture']}"
     is_macos = platform.system() == 'Darwin'
+    # Handle Linux vs macOS QEMU binary naming differences
+    if is_macos:
+        config['qemu_executable'] = f"qemu-system-{config['architecture']}"
+    else:  # Linux
+        # Try different executable name patterns commonly used in Linux distributions
+        possible_names = [
+            f"qemu-system-{config['architecture']}",  # Debian/Ubuntu style
+            f"qemu-{config['architecture']}"           # Other distros style
+        ]
+
+        for name in possible_names:
+            if shutil.which(name):
+                config['qemu_executable'] = name
+                break
+        else:
+            print(f"Error: Could not find QEMU executable for {config['architecture']}. Tried: {', '.join(possible_names)}", file=sys.stderr)
+            sys.exit(1)
     host_arch, guest_arch = platform.machine(), config['architecture']
     is_native = (host_arch == 'arm64' and guest_arch == 'aarch64') or (host_arch == 'x86_64' and guest_arch == 'x86_64')
 
@@ -563,18 +579,18 @@ def main():
         else:  # Linux
             # Try standard Linux paths
             uefi_code = f"/usr/share/qemu/{fw_filename}"
-            if not os.path.exists(uefi_code): 
+            if not os.path.exists(uefi_code):
                 # Fallback to OVMF naming convention
                 if config['architecture'] == 'x86_64':
-                    uefi_code = "/usr/share/OVMF/OVMF_CODE.fd" 
+                    uefi_code = "/usr/share/OVMF/OVMF_CODE.fd"
 
-        if not config["uefi_code_path"]: 
+        if not config["uefi_code_path"]:
             config["uefi_code_path"] = uefi_code
-        
+
         if not config["uefi_vars_path"]:
             disk_path = Path(config["disk_image"])
             config["uefi_vars_path"] = str(disk_path.parent / f"{disk_path.stem}-{config['architecture']}-vars.fd")
-        
+
         if not os.path.exists(config["uefi_code_path"]):
             print(f"Error: UEFI firmware file not found at: {config['uefi_code_path']}", file=sys.stderr)
             if is_macos:
@@ -582,7 +598,7 @@ def main():
             else:
                 print("       Please install your distribution's UEFI package (e.g., ovmf, edk2)", file=sys.stderr)
             sys.exit(1)
-        
+
         prepare_uefi_vars_file(config["uefi_vars_path"], config["uefi_code_path"])
 
     # Rename for consistency before passing to build_qemu_args
