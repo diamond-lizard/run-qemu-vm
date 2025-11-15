@@ -163,7 +163,8 @@ def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
         'riscv64': ['bootriscv64.efi']
     }
     patterns = bootloader_patterns.get(architecture)
-    if not patterns: return None, None
+    if not patterns:
+        return None, None
     print(f"Info: Searching for UEFI bootloader in '{iso_path}' for {architecture}...")
 
     tools_tried = []
@@ -217,30 +218,36 @@ def find_kernel_and_initrd(seven_zip_executable, iso_path):
     Inspects an ISO to find the paths to a Linux kernel and initial ramdisk
     by searching for common file names (vmlinuz, initrd/initramfs) using
     isoinfo (preferred) or 7z.
+
+    Returns (kernel_path, initrd_path) if found, or (None, None) if not found.
     """
-    # Debian stores kernel in /boot/ with paths like: 
-    # /boot/vmlinuz and /boot/initrd.gz
-    # Different search patterns for Linux and macOS
+    found_kernel, found_initrd = None, None
+    print(f"Info: Searching for kernel and initrd in '{iso_path}'...")
+
+    # Initialize candidate lists for Linux detection
+    candidate_kernels = []
+    candidate_initrds = []
+
     if platform.system() == 'Linux':
-        # Linux-specific patterns focusing on Debian paths - updated with install.amd paths
+        # Linux patterns including DVD root paths and flexible Debian support
         kernel_patterns = [
-            r'/install\.amd/vmlinuz$',  # Debian installer path
-            r'/boot/vmlinuz$',
+            r'/vmlinuz$',
+            r'/install(\.amd)?/.*vmlinuz',
+            r'/boot/vmlinuz',
             r'vmlinuz$',
             r'boot/linux$'
         ]
         initrd_patterns = [
-            r'/install\.amd/initrd\.gz$',  # Debian installer path
-            r'/boot/initrd\.gz$',
-            r'/boot/initramfs\.gz$',
+            r'/initrd\.gz$',
+            r'/install(\.amd)?/.*initrd\.gz',
+            r'/boot/initrd\.gz',
+            r'/boot/initramfs\.gz',
             r'initrd\.gz$'
         ]
     else:
         # Original macOS patterns unchanged
         kernel_patterns = [r'vmlinuz', r'/boot/vmlinuz', r'boot/linux']
         initrd_patterns = [r'initrd', r'initramfs', r'/boot/initrd', r'/boot/initramfs']
-    found_kernel, found_initrd = None, None
-    print(f"Info: Searching for kernel and initrd in '{iso_path}'...")
 
     tools_tried = []
 
@@ -248,40 +255,80 @@ def find_kernel_and_initrd(seven_zip_executable, iso_path):
     isoinfo_path = shutil.which("isoinfo")
     if isoinfo_path:
         try:
-            # -R for Rock Ridge, -l for long listing (includes full path)
-            # Encoding='latin-1' and errors='ignore' handle non-standard ISO character sets.
             result = subprocess.run([isoinfo_path, '-R', '-l', '-i', iso_path], capture_output=True, text=True, check=True, encoding='latin-1', errors='ignore')
             tools_tried.append("isoinfo")
 
-            for line in result.stdout.splitlines():
-                # isoinfo output format is complex, often needs path extraction.
-                # Look for files based on common patterns.
-                parts = line.split()
-                if len(parts) > 8:
-                    full_path = parts[-1].lstrip('./').replace('\\', '/')
-                    lower_path = full_path.lower()
+            current_directory = None
+            candidate_kernels = []
+            candidate_initrds = []
 
-                    if not found_kernel:
+            blocks = result.stdout.split("\n\n")
+            for block in blocks:
+                lines = [line.strip() for line in block.splitlines()]
+                if not lines:
+                    continue
+
+                dir_header = next((line for line in lines if line.startswith("Directory listing of")), None)
+                if dir_header:
+                    current_directory = dir_header.split()[-1].strip("'").strip(":")
+
+                if not current_directory:
+                    continue
+
+                for line in lines:
+                    if not line.startswith('-r-'):
+                        continue
+
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+
+                    try:
+                        filename = parts[-1]
+                        if filename in ('.', '..'):
+                            continue
+
+                        full_path = os.path.join('/', current_directory, filename)
+                        full_path = full_path.replace('\\', '/').replace('//', '/')
+                        lower_path = full_path.lower()
+
+                        file_size = int(parts[4])
+                        if file_size < 100_000:
+                            continue
+
                         for pattern in kernel_patterns:
-                            if pattern in lower_path and not lower_path.endswith('.mod') and lower_path.endswith(('bin', 'z', 'bimage', 'elf')):
-                                found_kernel = full_path
+                            if re.search(pattern, lower_path):
+                                candidate_kernels.append((full_path, file_size))
+                                if os.environ.get("DEBUG"):
+                                    print(f"Debug: Kernel candidate: {full_path} (size:{file_size})")
                                 break
 
-                    if not found_initrd:
                         for pattern in initrd_patterns:
-                            if pattern in lower_path and lower_path.endswith(('.img', '.gz')):
-                                found_initrd = full_path
+                            if re.search(pattern, lower_path):
+                                candidate_initrds.append((full_path, file_size))
+                                if os.environ.get("DEBUG"):
+                                    print(f"Debug: Initrd candidate: {full_path} (size:{file_size})")
                                 break
 
-                    if found_kernel and found_initrd:
-                        print(f"Info: Found Kernel: {found_kernel} (using isoinfo)")
-                        print(f"Info: Found Initrd: {found_initrd} (using isoinfo)")
-                        # On Linux we need full paths, on macOS the shorter paths work
-                        if platform.system() == 'Linux':
-                            return found_kernel, found_initrd
-                        else:
-                            # QEMU for macOS needs path relative to ISO root
-                            return found_kernel.lstrip('/'), found_initrd.lstrip('/')
+                    except (ValueError, IndexError) as e:
+                        if os.environ.get("DEBUG"):
+                            print(f"Debug: Skipping malformed ISO line: {line} ({e})")
+
+            candidate_kernels.sort(key=lambda x: (x[0].count('/'), -x[1]))
+            candidate_initrds.sort(key=lambda x: (x[0].count('/'), -x[1]))
+
+            if platform.system() == 'Linux':
+                if candidate_kernels and candidate_initrds:
+                    found_kernel = candidate_kernels[0][0]
+                    found_initrd = candidate_initrds[0][0]
+                    print(f"Info: Best kernel candidate: {found_kernel}")
+                    print(f"Info: Best initrd candidate: {found_initrd}")
+                    return found_kernel, found_initrd
+            else:
+                if found_kernel and found_initrd:
+                    print(f"Info: Found Kernel: {found_kernel} (using pattern matching)")
+                    print(f"Info: Found Initrd: {found_initrd} (using pattern matching)")
+                    return found_kernel.lstrip('/'), found_initrd.lstrip('/')
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             tools_tried[-1] = f"isoinfo failed ({e})"
 
@@ -296,14 +343,12 @@ def find_kernel_and_initrd(seven_zip_executable, iso_path):
                 full_path = parts[-1].lstrip('./').replace('\\', '/')
                 lower_path = full_path.lower()
 
-                # Check for kernel
                 if not found_kernel:
                     for pattern in kernel_patterns:
                         if pattern in lower_path and not lower_path.endswith('.mod') and lower_path.endswith(('bin', 'z', 'bimage', 'elf')):
                             found_kernel = full_path
                             break
 
-                # Check for initrd
                 if not found_initrd:
                     for pattern in initrd_patterns:
                         if pattern in lower_path and lower_path.endswith(('.img', '.gz')):
@@ -318,6 +363,7 @@ def find_kernel_and_initrd(seven_zip_executable, iso_path):
         tools_tried.append(f"7z failed ({e})")
 
     print(f"Warning: Could not find a suitable Linux kernel and initial ramdisk (initrd) in the ISO for direct boot. Tried: {', '.join(tools_tried)}", file=sys.stderr)
+    print("Warning: Falling back to standard BIOS boot (direct kernel boot disabled).", file=sys.stderr)
     return None, None
 
 
@@ -332,49 +378,113 @@ def add_direct_kernel_boot_args(base_args, config, kernel_file, initrd_file):
     # with -kernel and -initrd flags.
     if config["cdrom"] in args:
         cdrom_index = args.index("-cdrom")
-        args.pop(cdrom_index)  # remove '-cdrom'
-        args.pop(cdrom_index)  # remove its path
+        args.pop(cdrom_index)
+        args.pop(cdrom_index)
 
     # 2. Add the direct boot arguments
-    # The crucial serial console argument is console=ttyS0,115200n8
     kernel_cmd_line = "console=ttyS0,115200n8 panic=1"
 
-    # For Linux QEMU, we need to specify absolute path within ISO using '/'
-    # macOS QEMU handles relative paths differently
-    iso_kernel_path = kernel_file
-    iso_initrd_path = initrd_file
     if platform.system() == 'Linux':
-        iso_kernel_path = f"/{kernel_file}"
-        iso_initrd_path = f"/{initrd_file}"
+        with tempfile.TemporaryDirectory(prefix="qemu-kernel-") as temp_dir:
+            kernel_path = os.path.join(temp_dir, os.path.basename(kernel_file))
+            initrd_path = os.path.join(temp_dir, os.path.basename(initrd_file))
 
-    args.extend([
-        # The 'iso:...' syntax tells QEMU to extract the file from the ISO image.
-        "-kernel", f"iso:{config['cdrom']}:{iso_kernel_path}",
-        "-initrd", f"iso:{config['cdrom']}:{iso_initrd_path}",
-        "-append", kernel_cmd_line,
-        "-nographic"
-    ])
+            try:
+                kernel_extract_path = kernel_file.lstrip('/')
+                initrd_extract_path = initrd_file.lstrip('/')
 
-    print(f"Info: Direct Kernel Boot with append args: '{kernel_cmd_line}'")
+                if os.environ.get("DEBUG"):
+                    print(f"Debug: Extracting kernel from '{kernel_extract_path}' in ISO")
+                    print(f"Debug: Extracting initrd from '{initrd_extract_path}' in ISO")
 
-    # 3. Set up the serial console and monitor
-    monitor_socket = f"/tmp/qemu-monitor-{os.getpid()}.sock"
-    config['monitor_socket'] = monitor_socket
-    args.extend(["-monitor", f"unix:{monitor_socket},server,nowait", "-chardev", "pty,id=char0"])
+                result = subprocess.run(
+                    [config["seven_zip_executable"], "e", config["cdrom"],
+                     f"-o{temp_dir}", kernel_extract_path],
+                    capture_output=True, text=True, check=False
+                )
 
-    serial_profile_key = config.get("serial_device") or ARCH_DEFAULT_SERIAL.get(config['architecture'], ARCH_DEFAULT_SERIAL['default'])
-    serial_args = SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
-    print(f"Info: Using '{serial_profile_key}' serial profile for Direct Kernel Boot.")
-    args.extend(serial_args)
+                if result.returncode != 0 or not os.path.exists(kernel_path):
+                    print(f"Error: Failed to extract kernel '{kernel_extract_path}' from ISO.", file=sys.stderr)
+                    if os.environ.get("DEBUG"):
+                        print(f"Debug: 7z output: {result.stdout}", file=sys.stderr)
+                        print(f"Debug: 7z errors: {result.stderr}", file=sys.stderr)
+                    sys.exit(1)
 
-    # 4. Final step for this path: run QEMU and exit the script
-    run_qemu(args, config)
-    sys.exit(0) # Terminate the script after successful QEMU run
+                print(f"Info: Extracted kernel to: {kernel_path}")
+                if os.environ.get("DEBUG"):
+                    print(f"Debug: Kernel exists: {os.path.exists(kernel_path)}, size: {os.path.getsize(kernel_path)} bytes")
+
+                result = subprocess.run(
+                    [config["seven_zip_executable"], "e", config["cdrom"],
+                     f"-o{temp_dir}", initrd_extract_path],
+                    capture_output=True, text=True, check=False
+                )
+
+                if result.returncode != 0 or not os.path.exists(initrd_path):
+                    print(f"Error: Failed to extract initrd '{initrd_extract_path}' from ISO.", file=sys.stderr)
+                    if os.environ.get("DEBUG"):
+                        print(f"Debug: 7z output: {result.stdout}", file=sys.stderr)
+                        print(f"Debug: 7z errors: {result.stderr}", file=sys.stderr)
+                    sys.exit(1)
+
+                print(f"Info: Extracted initrd to: {initrd_path}")
+                if os.environ.get("DEBUG"):
+                    print(f"Debug: Initrd exists: {os.path.exists(initrd_path)}, size: {os.path.getsize(initrd_path)} bytes")
+
+            except Exception as e:
+                print(f"Error: Failed to extract files from ISO: {e}", file=sys.stderr)
+                sys.exit(1)
+
+            args.extend([
+                "-kernel", kernel_path,
+                "-initrd", initrd_path,
+                "-append", kernel_cmd_line,
+                "-nographic"
+            ])
+
+            print(f"Info: Direct Kernel Boot with append args: '{kernel_cmd_line}'")
+
+            monitor_socket = f"/tmp/qemu-monitor-{os.getpid()}.sock"
+            config['monitor_socket'] = monitor_socket
+            args.extend(["-monitor", f"unix:{monitor_socket},server,nowait", "-chardev", "pty,id=char0"])
+
+            serial_profile_key = config.get("serial_device") or ARCH_DEFAULT_SERIAL.get(config['architecture'], ARCH_DEFAULT_SERIAL['default'])
+            serial_args = SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
+            print(f"Info: Using '{serial_profile_key}' serial profile for Direct Kernel Boot.")
+            args.extend(serial_args)
+
+            run_qemu(args, config)
+            sys.exit(0)
+    else:
+        # Original macOS behavior
+        iso_kernel_path = kernel_file.lstrip('/')
+        iso_initrd_path = initrd_file.lstrip('/')
+        args.extend([
+            "-kernel", f"iso:{config['cdrom']}:{iso_kernel_path}",
+            "-initrd", f"iso:{config['cdrom']}:{iso_initrd_path}",
+            "-append", kernel_cmd_line,
+            "-nographic"
+        ])
+
+        print(f"Info: Direct Kernel Boot with append args: '{kernel_cmd_line}'")
+
+        monitor_socket = f"/tmp/qemu-monitor-{os.getpid()}.sock"
+        config['monitor_socket'] = monitor_socket
+        args.extend(["-monitor", f"unix:{monitor_socket},server,nowait", "-chardev", "pty,id=char0"])
+
+        serial_profile_key = config.get("serial_device") or ARCH_DEFAULT_SERIAL.get(config['architecture'], ARCH_DEFAULT_SERIAL['default'])
+        serial_args = SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
+        print(f"Info: Using '{serial_profile_key}' serial profile for Direct Kernel Boot.")
+        args.extend(serial_args)
+
+        run_qemu(args, config)
+        sys.exit(0)
 
 
 def parse_share_dir_argument(share_dir_arg):
     """Parse and validate the --share-dir argument."""
-    if not share_dir_arg: return None, None
+    if not share_dir_arg:
+        return None, None
     if ':' not in share_dir_arg:
         print("Error: --share-dir format must be '/host/path:mount_tag'", file=sys.stderr)
         sys.exit(1)
@@ -417,13 +527,16 @@ class TextConsoleManager:
             for i in range(20):
                 try:
                     self.pty_fd = os.open(self.pty_device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-                    if i > 0: print(f"Info: PTY device '{self.pty_device}' opened successfully after {i+1} attempts.")
+                    if i > 0:
+                        print(f"Info: PTY device '{self.pty_device}' opened successfully after {i+1} attempts.")
                     break
                 except FileNotFoundError:
                     if i < 19:
-                        if i == 0: print(f"Info: PTY device '{self.pty_device}' not yet available, retrying...", file=sys.stdout)
+                        if i == 0:
+                            print(f"Info: PTY device '{self.pty_device}' not yet available, retrying...", file=sys.stdout)
                         time.sleep(0.1)
-                    else: raise
+                    else:
+                        raise
 
             attrs = termios.tcgetattr(self.pty_fd)
             attrs[0] = attrs[1] = attrs[3] = 0
@@ -432,14 +545,20 @@ class TextConsoleManager:
 
             self.monitor_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             for _ in range(20):
-                try: self.monitor_sock.connect(self.monitor_socket_path); break
-                except (FileNotFoundError, ConnectionRefusedError): time.sleep(0.1)
-            else: print("Warning: Could not connect to QEMU monitor", file=sys.stderr)
+                try:
+                    self.monitor_sock.connect(self.monitor_socket_path)
+                    break
+                except (FileNotFoundError, ConnectionRefusedError):
+                    time.sleep(0.1)
+            else:
+                print("Warning: Could not connect to QEMU monitor", file=sys.stderr)
 
             self.monitor_sock.setblocking(False)
             try:
-                while self.monitor_sock.recv(4096): pass
-            except BlockingIOError: pass
+                while self.monitor_sock.recv(4096):
+                    pass
+            except BlockingIOError:
+                pass
 
             self.original_settings = termios.tcgetattr(self.stdin_fd)
             tty.setraw(self.stdin_fd)
@@ -450,16 +569,21 @@ class TextConsoleManager:
             return False
 
     def restore_terminal(self):
-        if self.original_settings: termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN, self.original_settings)
+        if self.original_settings:
+            termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN, self.original_settings)
 
     def show_control_menu(self):
         self.restore_terminal()
         print("\n╔════════════════════════════════════╗\n║ run-qemu-vm.py Control Menu        ║\n╠════════════════════════════════════╣\n║ q - Quit QEMU and exit             ║\n║ m - Enter QEMU monitor             ║\n║ r - Resume serial console          ║\n╚════════════════════════════════════╝\nChoice: ", end='', flush=True)
         choice = sys.stdin.read(1)
-        if choice.lower() == 'q': self.quit_qemu(); return False
+        if choice.lower() == 'q':
+            self.quit_qemu()
+            return False
         self.current_mode = MODE_QEMU_MONITOR if choice.lower() == 'm' else MODE_SERIAL_CONSOLE
-        if self.current_mode == MODE_QEMU_MONITOR: print("\nEntering QEMU monitor (Ctrl-] for menu)... \n(qemu) ", end='', flush=True)
-        else: print("\nResuming serial console...", flush=True)
+        if self.current_mode == MODE_QEMU_MONITOR:
+            print("\nEntering QEMU monitor (Ctrl-] for menu)... \n(qemu) ", end='', flush=True)
+        else:
+            print("\nResuming serial console...", flush=True)
         tty.setraw(self.stdin_fd)
         return True
 
@@ -468,7 +592,8 @@ class TextConsoleManager:
         try:
             self.monitor_sock.send(b"quit\n")
             self.qemu_process.wait(timeout=5)
-        except: self.qemu_process.kill()
+        except Exception:
+            self.qemu_process.kill()
         print("VM stopped.")
 
     def run(self):
@@ -479,25 +604,35 @@ class TextConsoleManager:
                     if self.stdin_fd in readable:
                         data = os.read(self.stdin_fd, 1024)
                         if b'\x1d' in data:
-                            if not self.show_control_menu(): break
-                        else: os.write(self.pty_fd, data.replace(b'\x7f', b'\x08'))
-                    if self.pty_fd in readable and (data := os.read(self.pty_fd, 4096)): os.write(self.stdout_fd, data)
+                            if not self.show_control_menu():
+                                break
+                        else:
+                            os.write(self.pty_fd, data.replace(b'\x7f', b'\x08'))
+                    if self.pty_fd in readable and (data := os.read(self.pty_fd, 4096)):
+                        os.write(self.stdout_fd, data)
                 elif self.current_mode == MODE_QEMU_MONITOR:
                     readable, _, _ = select.select([self.stdin_fd, self.monitor_sock], [], [], 0.1)
                     if self.stdin_fd in readable:
                         data = os.read(self.stdin_fd, 1024)
                         if b'\x1d' in data:
-                            if not self.show_control_menu(): break
-                        else: self.monitor_sock.send(data)
-                    if self.monitor_sock in readable and (data := self.monitor_sock.recv(4096)): os.write(self.stdout_fd, data)
+                            if not self.show_control_menu():
+                                break
+                        else:
+                            self.monitor_sock.send(data)
+                    if self.monitor_sock in readable and (data := self.monitor_sock.recv(4096)):
+                        os.write(self.stdout_fd, data)
         except (OSError, KeyboardInterrupt) as e:
-            if isinstance(e, KeyboardInterrupt): print("\n\nInterrupted. Shutting down...")
-            else: print(f"\nConsole error: {e}", file=sys.stderr)
+            if isinstance(e, KeyboardInterrupt):
+                print("\n\nInterrupted. Shutting down...")
+            else:
+                print(f"\nConsole error: {e}", file=sys.stderr)
             self.quit_qemu()
         finally:
             self.restore_terminal()
-            if self.pty_fd: os.close(self.pty_fd)
-            if self.monitor_sock: self.monitor_sock.close()
+            if self.pty_fd:
+                os.close(self.pty_fd)
+            if self.monitor_sock:
+                self.monitor_sock.close()
             return self.qemu_process.returncode or 0
 
 def parse_pty_device_from_thread(process, event, result_holder):
@@ -523,25 +658,26 @@ def build_qemu_args(config):
         "-netdev", config["network_backend"], "-device", config["network_device"],
         "-hda", config["disk_image"], "-device", config["usb_controller"],
     ]
-    if config["cdrom"]: args.extend(["-cdrom", config["cdrom"]])
+    if config["cdrom"]:
+        args.extend(["-cdrom", config["cdrom"]])
     if config.get("share_dir"):
         host_path, mount_tag = parse_share_dir_argument(config["share_dir"])
         if host_path and mount_tag:
             args.extend(["-virtfs", f"local,path={host_path},mount_tag={mount_tag},security_model={VIRTFS_SECURITY_MODEL},id={mount_tag}"])
-        else: sys.exit(1)
+        else:
+            sys.exit(1)
 
     # --- NEW: Direct Kernel Boot Attempt for text console (Linux only) ---
     is_linux = platform.system() == 'Linux'
-    # Only try direct kernel boot if it's Linux, text mode, has an ISO, and a supported architecture
     if is_linux and config['console'] == 'text' and config["cdrom"] and config['architecture'] in ['x86_64', 'aarch64', 'riscv64']:
         print("Info: Text console requested with CD-ROM on Linux. Attempting automated Direct Kernel Boot for reliable serial output.")
         kernel_file, initrd_file = find_kernel_and_initrd(config["seven_zip_executable"], config["cdrom"])
 
         if kernel_file and initrd_file:
-            # If successful, this function executes QEMU and exits the script successfully,
-            # so the rest of build_qemu_args is skipped.
             add_direct_kernel_boot_args(args, config, kernel_file, initrd_file)
-            return # Exit build_qemu_args
+            return
+        else:
+            print("Info: Direct kernel boot not available for this ISO. Continuing with standard boot.", file=sys.stderr)
 
     # --- Firmware Selection Logic ---
     use_uefi = None
@@ -552,7 +688,6 @@ def build_qemu_args(config):
         use_uefi = True
         print("Info: User explicitly selected UEFI boot.")
     else:
-        # Automatic selection logic
         is_x86 = config['architecture'] in ['x86_64', 'i386']
         if is_x86 and config['console'] == 'text':
             use_uefi = False
@@ -569,7 +704,8 @@ def build_qemu_args(config):
             args.extend(["-drive", f"if=pflash,format=raw,readonly=on,file={config['uefi_code']}", "-drive", f"if=pflash,format=raw,file={config['uefi_vars']}"])
         else:
             print("Error: UEFI boot was selected, but UEFI firmware is not found.", file=sys.stderr)
-            if config.get('uefi_code'): print(f"       Attempted path: {config['uefi_code']}", file=sys.stderr)
+            if config.get('uefi_code'):
+                print(f"       Attempted path: {config['uefi_code']}", file=sys.stderr)
             print("       Please install QEMU's UEFI firmware files (e.g., 'edk2-qemu') or specify '--firmware bios'.", file=sys.stderr)
             sys.exit(1)
     else:
@@ -585,19 +721,16 @@ def build_qemu_args(config):
         print(f"Info: Using '{serial_profile_key}' serial profile.")
         args.extend(serial_args)
         args.append("-nographic")
-    else: # gui
-        # --- Graphics Device Selection ---
+    else:
         vga_type = config.get('vga_type')
         if not vga_type:
             if config['architecture'] in ['x86_64', 'i386']:
-                vga_type = 'std'  # Standard VGA card, most compatible
+                vga_type = 'std'
             elif config['architecture'] == 'aarch64':
-                # For ARM, virtio-gpu-pci is a device, not a -vga type.
-                # We add it as a separate device.
                 args.extend(["-device", "virtio-gpu-pci"])
-                vga_type = 'none' # Avoids QEMU adding a default VGA device
+                vga_type = 'none'
             else:
-                vga_type = 'std' # Generic fallback
+                vga_type = 'std'
 
         if vga_type != 'none':
             print(f"Info: Using VGA type '{vga_type}'.")
@@ -608,7 +741,6 @@ def build_qemu_args(config):
     boot_order = 'd' if config.get("boot_from") == 'cdrom' or (not config.get("boot_from") and config["cdrom"]) else 'c'
     args.extend(["-boot", f"order={boot_order}"])
 
-    # --- Smart Boot Automation (for UEFI mode, now only the fallback/macOS flow) ---
     if use_uefi and boot_order == 'd' and config["cdrom"]:
         create_and_run_uefi_with_automation(args, config)
     else:
@@ -629,9 +761,6 @@ def prepare_uefi_vars_file(vars_path, code_path):
 def run_qemu(args, config):
     """Executes the QEMU command and handles text console if needed."""
     print("--- Starting QEMU with the following command ---", flush=True)
-    # Format the command for readability, with each argument on a new line.
-    # The first argument is the command itself, followed by indented arguments.
-    # This mimics a shell script format for easy copying and understanding.
     formatted_command = f"{args[0]} \\\n"
     formatted_command += " \\\n".join([f"    {subprocess.list2cmdline([arg])}" for arg in args[1:]])
     print(formatted_command, flush=True)
@@ -644,23 +773,30 @@ def run_qemu(args, config):
             thread = threading.Thread(target=parse_pty_device_from_thread, args=(process, event, holder))
             thread.daemon = True
             thread.start()
-            if not event.wait(timeout=10.0) or not holder[0]: # Increased timeout for TCG
+            if not event.wait(timeout=10.0) or not holder[0]:
                 print("Error: Could not find PTY device in QEMU output within 10 seconds.", file=sys.stderr)
-                process.kill(); thread.join(); sys.exit(1)
+                process.kill()
+                thread.join()
+                sys.exit(1)
             console = TextConsoleManager(process, holder[0], config['monitor_socket'])
             if not console.setup():
-                process.kill(); thread.join(); sys.exit(1)
+                process.kill()
+                thread.join()
+                sys.exit(1)
             return_code = console.run()
             thread.join()
             sys.exit(return_code)
         else:
             process = subprocess.Popen(args)
             process.wait()
-            if process.returncode != 0: sys.exit(process.returncode)
+            if process.returncode != 0:
+                sys.exit(process.returncode)
     except FileNotFoundError:
-        print(f"Error: QEMU executable '{args[0]}' not found.", file=sys.stderr); sys.exit(1)
+        print(f"Error: QEMU executable '{args[0]}' not found.", file=sys.stderr)
+        sys.exit(1)
     except KeyboardInterrupt:
-        print("\nInterrupted"); sys.exit(130)
+        print("\nInterrupted")
+        sys.exit(130)
 
 def main():
     """Parses command-line arguments and launches the VM."""
@@ -681,7 +817,6 @@ def main():
     parser.add_argument("--smp-cores", type=int, default=SMP_CORES, help="Number of CPU cores.")
     parser.add_argument("--vga-type", default=None, help="QEMU VGA card type (e.g., std, virtio, qxl). Overrides automatic selection.")
 
-    # Suppressed from help as they are auto-detected or internal
     suppressed_args = {
         "qemu_executable": QEMU_EXECUTABLE, "seven_zip_executable": SEVEN_ZIP_EXECUTABLE, "brew_executable": BREW_EXECUTABLE,
         "uefi_code_path": UEFI_CODE_PATH, "uefi_vars_path": UEFI_VARS_PATH,
@@ -692,15 +827,17 @@ def main():
         cli_arg = f"--{arg.replace('_', '-')}"
         parser.add_argument(cli_arg, default=default_val, help=argparse.SUPPRESS)
 
-
     args = parser.parse_args()
     config = vars(args)
 
     if args.architecture == 'list':
-        print("Available QEMU architectures:\n" + "\n".join(f"  - {arch}" for arch in SUPPORTED_ARCHITECTURES)); sys.exit(0)
+        print("Available QEMU architectures:\n" + "\n".join(f"  - {arch}" for arch in SUPPORTED_ARCHITECTURES))
+        sys.exit(0)
     if args.architecture not in SUPPORTED_ARCHITECTURES:
-        print(f"Error: Unsupported architecture '{args.architecture}'. Use 'list' for options.", file=sys.stderr); sys.exit(1)
-    if not args.disk_image: parser.error("--disk-image is required.")
+        print(f"Error: Unsupported architecture '{args.architecture}'. Use 'list' for options.", file=sys.stderr)
+        sys.exit(1)
+    if not args.disk_image:
+        parser.error("--disk-image is required.")
 
     if args.serial_device == 'list':
         default_key = ARCH_DEFAULT_SERIAL.get(args.architecture, ARCH_DEFAULT_SERIAL['default'])
@@ -710,24 +847,21 @@ def main():
             print(f"  - {key:<10} {is_default:<10} {profile['description']}")
         sys.exit(0)
     if args.serial_device and args.serial_device not in SERIAL_DEVICE_PROFILES:
-        print(f"Error: Unknown serial device profile '{args.serial_device}'. Use 'list' for options.", file=sys.stderr); sys.exit(1)
+        print(f"Error: Unknown serial device profile '{args.serial_device}'. Use 'list' for options.", file=sys.stderr)
+        sys.exit(1)
 
     is_macos = platform.system() == 'Darwin'
-    # Handle Linux vs macOS QEMU binary naming differences
     if is_macos:
         config['qemu_executable'] = f"qemu-system-{config['architecture']}"
-    else:  # Linux
-        # Only look for system emulators, skip user-mode emulators (qemu-*)
+    else:
         arch = config['architecture']
         possible_names = [f"qemu-system-{arch}"]
 
-        # Add architecture variants for common naming schemes
         if arch == 'x86_64':
-            possible_names.append("qemu-system-x86")  # Some distros use shorter names
+            possible_names.append("qemu-system-x86")
         elif arch == 'i386':
             possible_names.append("qemu-system-i386")
 
-        # Always try the exact architecture name first
         for name in possible_names:
             if shutil.which(name):
                 config['qemu_executable'] = name
@@ -741,34 +875,38 @@ def main():
 
     if config['accelerator'] is None:
         if sys.platform == "darwin" and is_native:
-            config['accelerator'] = 'hvf'; print("Info: Auto-selected 'hvf' accelerator for native hardware virtualization.")
+            config['accelerator'] = 'hvf'
+            print("Info: Auto-selected 'hvf' accelerator for native hardware virtualization.")
         else:
-            config['accelerator'] = 'tcg'; print("Info: Auto-selected 'tcg' accelerator for emulation.")
+            config['accelerator'] = 'tcg'
+            print("Info: Auto-selected 'tcg' accelerator for emulation.")
 
-    # On Linux with TCG, always use 'max' CPU model regardless of architecture
     if not is_macos and config['accelerator'] == 'tcg':
         if config['cpu_model'] == 'host':
             config['cpu_model'] = 'max'
-            print(f"Info: Forced 'max' CPU model for TCG emulation on Linux.")
+            print("Info: Forced 'max' CPU model for TCG emulation on Linux.")
     elif config['cpu_model'] == 'host' and not is_native:
-        config['cpu_model'] = 'max'; print(f"Info: Auto-selected CPU model '{config['cpu_model']}' for emulation.")
+        config['cpu_model'] = 'max'
+        print(f"Info: Auto-selected CPU model '{config['cpu_model']}' for emulation.")
 
-    if not os.path.exists(config["disk_image"]): print(f"Error: Disk image not found: {config['disk_image']}", file=sys.stderr); sys.exit(1)
-    if config["cdrom"] and not os.path.exists(config["cdrom"]): print(f"Error: CD-ROM image not found: {config['cdrom']}", file=sys.stderr); sys.exit(1)
+    if not os.path.exists(config["disk_image"]):
+        print(f"Error: Disk image not found: {config['disk_image']}", file=sys.stderr)
+        sys.exit(1)
+    if config["cdrom"] and not os.path.exists(config["cdrom"]):
+        print(f"Error: CD-ROM image not found: {config['cdrom']}", file=sys.stderr)
+        sys.exit(1)
 
-    if config['architecture'] == 'x86_64' and config['machine_type'] == 'virt': config['machine_type'] = 'q35'
+    if config['architecture'] == 'x86_64' and config['machine_type'] == 'virt':
+        config['machine_type'] = 'q35'
 
-    # Prepare UEFI paths so they are available for build_qemu_args if needed.
     fw_map = {'aarch64': 'edk2-aarch64-code.fd', 'x86_64': 'edk2-x86_64-code.fd', 'riscv64': 'edk2-riscv64-code.fd'}
     if (fw_filename := fw_map.get(config['architecture'])):
         if is_macos:
             qemu_prefix = get_qemu_prefix(config['brew_executable'])
             uefi_code = str(qemu_prefix / "share/qemu" / fw_filename)
-        else:  # Linux
-            # Try standard Linux paths
+        else:
             uefi_code = f"/usr/share/qemu/{fw_filename}"
             if not os.path.exists(uefi_code):
-                # Fallback to OVMF naming convention
                 if config['architecture'] == 'x86_64':
                     uefi_code = "/usr/share/OVMF/OVMF_CODE.fd"
 
@@ -789,7 +927,6 @@ def main():
 
         prepare_uefi_vars_file(config["uefi_vars_path"], config["uefi_code_path"])
 
-    # Rename for consistency before passing to build_qemu_args
     config['uefi_code'] = config.pop('uefi_code_path', None)
     config['uefi_vars'] = config.pop('uefi_vars_path', None)
 
