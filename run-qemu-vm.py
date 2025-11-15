@@ -119,7 +119,7 @@ ARCH_DEFAULT_SERIAL = {
 # The network backend mode for QEMU user-mode networking (SLIRP/NAT).
 NETWORK_MODE = "user"
 NETWORK_ID = "net0"
-NETWORK_PORT_FORWARDS = "hostfwd=tcp::2222-:22"
+NETWORK_PORT_FORWARDS = "hostfwd=tcp::2222-:22,hostfwd=tcp::6001-:6001"
 NETWORK_BACKEND = f"{NETWORK_MODE},id={NETWORK_ID}" + (f",{NETWORK_PORT_FORWARDS}" if NETWORK_PORT_FORWARDS else "")
 NETWORK_DEVICE = f"virtio-net-pci,netdev={NETWORK_ID}"
 
