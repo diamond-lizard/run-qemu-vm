@@ -17,6 +17,7 @@
 #   3. UEFI installation with a text-only terminal (x86_64):
 #      ./run-qemu-vm.py --architecture x86_64 --disk-image my-x86.qcow2 --cdrom alpine-virt.iso --console text
 #      # Script forces BIOS boot for x86 text mode to use serial-friendly bootloaders.
+#      # On Linux with --console text and --cdrom, it attempts automated direct kernel boot.
 #      # Press Ctrl-] for control menu
 #
 #   4. Share a directory with the guest:
@@ -29,6 +30,8 @@
 # Prerequisites:
 #   - QEMU must be installed (e.g., via `brew install qemu`).
 #   - For automated UEFI boot on simple ISOs, '7z' must be in the PATH.
+#   - For Linux direct kernel boot, 'isoinfo' (from genisoimage) is preferred,
+#     with '7z' as a fallback.
 #   - For directory sharing, guest kernel must have 9P support (CONFIG_9P_FS).
 #
 
@@ -208,6 +211,136 @@ def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
         print(f"Warning: Could not find a suitable bootloader ({', '.join(patterns)}) in the ISO. Tried: {', '.join(tools_tried)}", file=sys.stderr)
         return None, None
 
+
+def find_kernel_and_initrd(seven_zip_executable, iso_path):
+    """
+    Inspects an ISO to find the paths to a Linux kernel and initial ramdisk
+    by searching for common file names (vmlinuz, initrd/initramfs) using
+    isoinfo (preferred) or 7z.
+    """
+    kernel_patterns = [r'vmlinuz', r'/boot/vmlinuz', r'boot/linux']
+    initrd_patterns = [r'initrd', r'initramfs', r'/boot/initrd', r'/boot/initramfs']
+    found_kernel, found_initrd = None, None
+    print(f"Info: Searching for kernel and initrd in '{iso_path}'...")
+
+    tools_tried = []
+
+    # --- Attempt 1: isoinfo (Linux preference) ---
+    isoinfo_path = shutil.which("isoinfo")
+    if isoinfo_path:
+        try:
+            # -R for Rock Ridge, -l for long listing (includes full path)
+            # Encoding='latin-1' and errors='ignore' handle non-standard ISO character sets.
+            result = subprocess.run([isoinfo_path, '-R', '-l', '-i', iso_path], capture_output=True, text=True, check=True, encoding='latin-1', errors='ignore')
+            tools_tried.append("isoinfo")
+
+            for line in result.stdout.splitlines():
+                # isoinfo output format is complex, often needs path extraction.
+                # Look for files based on common patterns.
+                parts = line.split()
+                if len(parts) > 8:
+                    full_path = parts[-1].lstrip('./').replace('\\', '/')
+                    lower_path = full_path.lower()
+
+                    if not found_kernel:
+                        for pattern in kernel_patterns:
+                            if pattern in lower_path and not lower_path.endswith('.mod') and lower_path.endswith(('bin', 'z', 'bimage', 'elf')):
+                                found_kernel = full_path
+                                break
+
+                    if not found_initrd:
+                        for pattern in initrd_patterns:
+                            if pattern in lower_path and lower_path.endswith(('.img', '.gz')):
+                                found_initrd = full_path
+                                break
+
+                    if found_kernel and found_initrd:
+                        print(f"Info: Found Kernel: {found_kernel} (using isoinfo)")
+                        print(f"Info: Found Initrd: {found_initrd} (using isoinfo)")
+                        # QEMU needs path relative to ISO root
+                        return found_kernel.lstrip('/'), found_initrd.lstrip('/')
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            tools_tried[-1] = f"isoinfo failed ({e})"
+
+    # --- Attempt 2: 7z fallback ---
+    try:
+        result = subprocess.run([seven_zip_executable, 'l', iso_path], capture_output=True, text=True, check=True)
+        tools_tried.append("7z")
+
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) > 0:
+                full_path = parts[-1].lstrip('./').replace('\\', '/')
+                lower_path = full_path.lower()
+
+                # Check for kernel
+                if not found_kernel:
+                    for pattern in kernel_patterns:
+                        if pattern in lower_path and not lower_path.endswith('.mod') and lower_path.endswith(('bin', 'z', 'bimage', 'elf')):
+                            found_kernel = full_path
+                            break
+
+                # Check for initrd
+                if not found_initrd:
+                    for pattern in initrd_patterns:
+                        if pattern in lower_path and lower_path.endswith(('.img', '.gz')):
+                            found_initrd = full_path
+                            break
+
+                if found_kernel and found_initrd:
+                    print(f"Info: Found Kernel: {found_kernel} (using 7z)")
+                    print(f"Info: Found Initrd: {found_initrd} (using 7z)")
+                    return found_kernel.lstrip('/'), found_initrd.lstrip('/')
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        tools_tried.append(f"7z failed ({e})")
+
+    print(f"Warning: Could not find a suitable Linux kernel and initial ramdisk (initrd) in the ISO for direct boot. Tried: {', '.join(tools_tried)}", file=sys.stderr)
+    return None, None
+
+
+def add_direct_kernel_boot_args(base_args, config, kernel_file, initrd_file):
+    """
+    Constructs QEMU arguments for direct kernel boot, injects the console argument,
+    and executes QEMU via run_qemu.
+    """
+    args = list(base_args)
+
+    # 1. Remove the existing -cdrom flag and its path, as we are replacing it
+    # with -kernel and -initrd flags.
+    if config["cdrom"] in args:
+        cdrom_index = args.index("-cdrom")
+        args.pop(cdrom_index)  # remove '-cdrom'
+        args.pop(cdrom_index)  # remove its path
+
+    # 2. Add the direct boot arguments
+    # The crucial serial console argument is console=ttyS0,115200n8
+    kernel_cmd_line = "console=ttyS0,115200n8 panic=1"
+
+    args.extend([
+        # The 'iso:...' syntax tells QEMU to extract the file from the ISO image.
+        "-kernel", f"iso:{config['cdrom']}:{kernel_file}",
+        "-initrd", f"iso:{config['cdrom']}:{initrd_file}",
+        "-append", kernel_cmd_line,
+        "-nographic"
+    ])
+
+    print(f"Info: Direct Kernel Boot with append args: '{kernel_cmd_line}'")
+
+    # 3. Set up the serial console and monitor
+    monitor_socket = f"/tmp/qemu-monitor-{os.getpid()}.sock"
+    config['monitor_socket'] = monitor_socket
+    args.extend(["-monitor", f"unix:{monitor_socket},server,nowait", "-chardev", "pty,id=char0"])
+
+    serial_profile_key = config.get("serial_device") or ARCH_DEFAULT_SERIAL.get(config['architecture'], ARCH_DEFAULT_SERIAL['default'])
+    serial_args = SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
+    print(f"Info: Using '{serial_profile_key}' serial profile for Direct Kernel Boot.")
+    args.extend(serial_args)
+
+    # 4. Final step for this path: run QEMU and exit the script
+    run_qemu(args, config)
+    sys.exit(0) # Terminate the script after successful QEMU run
+
+
 def parse_share_dir_argument(share_dir_arg):
     """Parse and validate the --share-dir argument."""
     if not share_dir_arg: return None, None
@@ -366,6 +499,19 @@ def build_qemu_args(config):
             args.extend(["-virtfs", f"local,path={host_path},mount_tag={mount_tag},security_model={VIRTFS_SECURITY_MODEL},id={mount_tag}"])
         else: sys.exit(1)
 
+    # --- NEW: Direct Kernel Boot Attempt for text console (Linux only) ---
+    is_linux = platform.system() == 'Linux'
+    # Only try direct kernel boot if it's Linux, text mode, has an ISO, and a supported architecture
+    if is_linux and config['console'] == 'text' and config["cdrom"] and config['architecture'] in ['x86_64', 'aarch64', 'riscv64']:
+        print("Info: Text console requested with CD-ROM on Linux. Attempting automated Direct Kernel Boot for reliable serial output.")
+        kernel_file, initrd_file = find_kernel_and_initrd(config["seven_zip_executable"], config["cdrom"])
+
+        if kernel_file and initrd_file:
+            # If successful, this function executes QEMU and exits the script successfully,
+            # so the rest of build_qemu_args is skipped.
+            add_direct_kernel_boot_args(args, config, kernel_file, initrd_file)
+            return # Exit build_qemu_args
+
     # --- Firmware Selection Logic ---
     use_uefi = None
     if config.get('firmware') == 'bios':
@@ -431,7 +577,7 @@ def build_qemu_args(config):
     boot_order = 'd' if config.get("boot_from") == 'cdrom' or (not config.get("boot_from") and config["cdrom"]) else 'c'
     args.extend(["-boot", f"order={boot_order}"])
 
-    # --- Smart Boot Automation (for UEFI mode) ---
+    # --- Smart Boot Automation (for UEFI mode, now only the fallback/macOS flow) ---
     if use_uefi and boot_order == 'd' and config["cdrom"]:
         create_and_run_uefi_with_automation(args, config)
     else:
