@@ -222,17 +222,18 @@ def find_kernel_and_initrd(seven_zip_executable, iso_path):
     # /boot/vmlinuz and /boot/initrd.gz
     # Different search patterns for Linux and macOS
     if platform.system() == 'Linux':
-        # Linux-specific patterns focusing on Debian paths
+        # Linux-specific patterns focusing on Debian paths - updated with install.amd paths
         kernel_patterns = [
-            r'/boot/vmlinuz$',  # Full path match for Debian
-            r'vmlinuz$',        # Fallback kernel name
-            r'boot/linux$'      # Alternative boot location
+            r'/install\.amd/vmlinuz$',  # Debian installer path
+            r'/boot/vmlinuz$',
+            r'vmlinuz$',
+            r'boot/linux$'
         ]
         initrd_patterns = [
-            r'/boot/initrd\.gz$',    # Debian initrd
-            r'/boot/initramfs\.gz$', # Other distros
-            r'initrd\.gz$',          # Fallback
-            r'initramfs\.gz$'        # Fallback
+            r'/install\.amd/initrd\.gz$',  # Debian installer path
+            r'/boot/initrd\.gz$',
+            r'/boot/initramfs\.gz$',
+            r'initrd\.gz$'
         ]
     else:
         # Original macOS patterns unchanged
