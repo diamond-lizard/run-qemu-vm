@@ -398,24 +398,23 @@ def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
         return None, None
     print(f"Info: Searching for UEFI bootloader in '{iso_path}' for {architecture}...")
 
-    tools_tried = []
+    finders = []
     is_macos = platform.system() == 'Darwin'
 
     # Prefer isoinfo on Linux
     if not is_macos:
-        name, path, reason = _find_uefi_bootloader_with_isoinfo(iso_path, patterns)
-        if name:
-            return name, path
-        tools_tried.append(reason)
+        finders.append(lambda: _find_uefi_bootloader_with_isoinfo(iso_path, patterns))
 
     # Fallback to 7z if available
-    name, path, reason = _find_uefi_bootloader_with_7z(seven_zip_executable, iso_path, patterns)
+    finders.append(lambda: _find_uefi_bootloader_with_7z(seven_zip_executable, iso_path, patterns))
+
+    name, path, reasons = _run_uefi_bootloader_finders(finders)
+
     if name:
         return name, path
-    tools_tried.append(reason)
 
     # If we get here, no tool worked
-    return _handle_uefi_bootloader_not_found(tools_tried, patterns)
+    return _handle_uefi_bootloader_not_found(reasons, patterns)
 
 
 def _try_isoinfo_for_kernel_initrd(iso_path, kernel_patterns, initrd_patterns):
@@ -450,6 +449,24 @@ def _warn_kernel_initrd_not_found(tools_tried):
     """Prints a warning that kernel/initrd could not be found."""
     print(f"Warning: Could not find a suitable Linux kernel and initial ramdisk (initrd) in the ISO for direct boot. Tried: {', '.join(tools_tried)}", file=sys.stderr)
     print("Warning: Falling back to standard BIOS boot (direct kernel boot disabled).", file=sys.stderr)
+
+
+def _run_uefi_bootloader_finders(finders):
+    """
+    Iterates through UEFI bootloader finder functions until one succeeds.
+
+    Each finder should return a tuple of (name, path, reason).
+    Returns a tuple of (name, path) on the first success.
+    If all finders fail, returns (None, None) and a list of failure reasons.
+    """
+    failure_reasons = []
+    for finder in finders:
+        name, path, reason = finder()
+        if name:
+            return name, path, []
+        if reason:
+            failure_reasons.append(reason)
+    return None, None, failure_reasons
 
 
 def _run_kernel_initrd_finders(finders):
