@@ -62,27 +62,27 @@ def _get_char_style(char):
     style_parts = []
 
     # Foreground color
-    fg = char.get("fg", "default")
+    fg = char.fg
     if fg.startswith("#"):
         style_parts.append(fg)
     elif fg != "default":
         style_parts.append(f"fg:ansi{fg}")
 
     # Background color
-    bg = char.get("bg", "default")
+    bg = char.bg
     if bg.startswith("#"):
         style_parts.append(f"bg:{bg}")
     elif bg != "default":
         style_parts.append(f"bg:ansi{bg}")
 
     # Attributes
-    if char.get("bold"):
+    if char.bold:
         style_parts.append("bold")
-    if char.get("italics"):
+    if char.italics:
         style_parts.append("italic")
-    if char.get("underline"):
+    if char.underscore:
         style_parts.append("underline")
-    if char.get("reverse"):
+    if char.reverse:
         style_parts.append("reverse")
 
     return " ".join(style_parts)
@@ -98,8 +98,8 @@ def _coalesce_char_into_fragment(char, current_text, current_style, line_fragmen
     Returns the updated text run and style.
     """
     style_str = _get_char_style(char)
-    # The `pyte.Char` object is `char['data']`. Its `data` attribute holds the character.
-    char_data = char["data"].data
+    # Access the character data directly from the Char object
+    char_data = char.data
 
     if style_str == current_style:
         current_text += char_data
@@ -119,7 +119,9 @@ def _process_line_to_fragments(y, pyte_screen):
     current_style = ""  # Start with an empty style string
 
     for x in range(pyte_screen.columns):
-        char = pyte_screen.buffer[y, x]
+        # Use two-level indexing: buffer[y][x] returns a Char object
+        # Note: buffer[y, x] (tuple indexing) returns StaticDefaultDict, which is incorrect
+        char = pyte_screen.buffer[y][x]
         current_text, current_style = _coalesce_char_into_fragment(
             char, current_text, current_style, line_fragments
         )
@@ -204,38 +206,52 @@ async def _handle_quit_action(app, monitor_sock):
     app.exit(result="User quit")
 
 
-async def _handle_monitor_action(app, current_mode, log_queue):
+async def _handle_monitor_action(app, current_mode, monitor_sock):
     """Handles the 'monitor' action from the control menu."""
+    # Switch mode first
     current_mode[0] = app_config.MODE_QEMU_MONITOR
-    await log_queue.put(
-        "\n--- Switched to QEMU Monitor (Ctrl-] for menu) ---\n"
-    )
+    
+    # Force a full redraw
     app.invalidate()
+    app.renderer.reset()
+    
+    # Send a newline to trigger the monitor prompt to be displayed
+    if monitor_sock:
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.sock_sendall(monitor_sock, b"\n")
+            # Give the monitor a moment to respond
+            await asyncio.sleep(0.3)
+            # Force another redraw after data arrives
+            app.invalidate()
+        except OSError:
+            pass
 
 
 async def _handle_resume_action(app, current_mode):
     """Handles the 'resume' action from the control menu."""
     current_mode[0] = app_config.MODE_SERIAL_CONSOLE
+    app.renderer.reset()
     app.invalidate()
 
 
 async def _process_control_menu_choice(
-    result, app, current_mode, log_queue, monitor_sock
+    result, app, current_mode, monitor_sock
 ):
     """Handles the action selected from the control menu."""
     if result == "quit":
         await _handle_quit_action(app, monitor_sock)
     elif result == "monitor":
-        await _handle_monitor_action(app, current_mode, log_queue)
+        await _handle_monitor_action(app, current_mode, monitor_sock)
     else:  # resume
         await _handle_resume_action(app, current_mode)
 
 
-async def _handle_control_menu(app, current_mode, log_queue, monitor_sock):
+async def _handle_control_menu(app, current_mode, monitor_sock):
     """Displays the control menu and handles the user's choice."""
     result = await _show_control_menu()
     await _process_control_menu_choice(
-        result, app, current_mode, log_queue, monitor_sock
+        result, app, current_mode, monitor_sock
     )
 
 
@@ -255,13 +271,13 @@ async def _forward_input(event, current_mode, pty_fd, monitor_sock):
         pass  # Ignore write errors if PTY/socket is closed
 
 
-def _create_key_bindings(current_mode, log_queue, pty_fd, monitor_sock):
+def _create_key_bindings(current_mode, pty_fd, monitor_sock):
     """Creates and configures the key bindings for the console application."""
     key_bindings = KeyBindings()
 
     @key_bindings.add("c-]", eager=True)
     async def _(event):
-        await _handle_control_menu(event.app, current_mode, log_queue, monitor_sock)
+        await _handle_control_menu(event.app, current_mode, monitor_sock)
 
     @key_bindings.add("<any>")
     async def _(event):
@@ -270,7 +286,7 @@ def _create_key_bindings(current_mode, log_queue, pty_fd, monitor_sock):
     return key_bindings
 
 
-def _create_console_layout(log_buffer, get_pty_screen_fragments, current_mode):
+def _create_console_layout(get_pty_screen_fragments, get_monitor_screen_fragments, current_mode):
     """Creates the prompt_toolkit layout for the console."""
     is_serial_mode = Condition(lambda: current_mode[0] == app_config.MODE_SERIAL_CONSOLE)
 
@@ -279,9 +295,9 @@ def _create_console_layout(log_buffer, get_pty_screen_fragments, current_mode):
         Window(content=pty_control, dont_extend_height=True), filter=is_serial_mode
     )
 
-    log_control = BufferControl(buffer=log_buffer)
+    monitor_control = FormattedTextControl(text=get_monitor_screen_fragments)
     monitor_container = ConditionalContainer(
-        Window(content=log_control, wrap_lines=True), filter=~is_serial_mode
+        Window(content=monitor_control, dont_extend_height=True), filter=~is_serial_mode
     )
 
     return Layout(HSplit([pty_container, monitor_container]))
@@ -329,16 +345,14 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue):
                 return
 
 
-async def _process_monitor_data(data, log_queue):
-    """Decodes monitor data and puts it in the log queue."""
-    text = data.decode("utf-8", errors="replace")
-    normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
-    sanitized_text = _sanitize_control_characters(normalized_text)
-    await log_queue.put(sanitized_text)
+def _process_monitor_data(data, app, monitor_pyte_stream):
+    """Feeds monitor data to the stream and invalidates the app."""
+    monitor_pyte_stream.feed(data)
+    app.invalidate()
 
 
-async def _read_from_monitor(monitor_sock, log_queue):
-    """Reads data from the QEMU monitor socket and puts it in the log queue."""
+async def _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue):
+    """Reads data from the QEMU monitor socket and feeds it to the monitor pyte stream."""
     if not monitor_sock:
         return
     loop = asyncio.get_running_loop()
@@ -347,7 +361,7 @@ async def _read_from_monitor(monitor_sock, log_queue):
             data = await loop.sock_recv(monitor_sock, 4096)
             if not data:
                 return  # Monitor connection closed, but don't exit app
-            await _process_monitor_data(data, log_queue)
+            _process_monitor_data(data, app, monitor_pyte_stream)
         except Exception:
             await _log_task_error(log_queue, "MONITOR", "ERROR")
             return
@@ -404,11 +418,13 @@ def _initialize_console_state():
     ]  # List to be mutable from closures
     pyte_screen = pyte.Screen(80, 24)
     pyte_stream = pyte.ByteStream(pyte_screen)
-    return log_queue, log_buffer, current_mode, pyte_screen, pyte_stream
+    monitor_pyte_screen = pyte.Screen(80, 24)
+    monitor_pyte_stream = pyte.ByteStream(monitor_pyte_screen)
+    return log_queue, log_buffer, current_mode, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream
 
 
 def _setup_console_app(
-    current_mode, log_queue, pty_fd, monitor_sock, log_buffer, pyte_screen
+    current_mode, pty_fd, monitor_sock, log_buffer, pyte_screen, monitor_pyte_screen
 ):
     """Creates and configures the prompt_toolkit Application."""
 
@@ -416,19 +432,23 @@ def _setup_console_app(
         """Wrapper to pass pyte_screen to the fragment generator."""
         return _get_pty_screen_fragments(pyte_screen)
 
-    key_bindings = _create_key_bindings(current_mode, log_queue, pty_fd, monitor_sock)
-    layout = _create_console_layout(log_buffer, get_pty_screen_fragments, current_mode)
+    def get_monitor_screen_fragments():
+        """Wrapper to pass monitor_pyte_screen to the fragment generator."""
+        return _get_pty_screen_fragments(monitor_pyte_screen)
+
+    key_bindings = _create_key_bindings(current_mode, pty_fd, monitor_sock)
+    layout = _create_console_layout(get_pty_screen_fragments, get_monitor_screen_fragments, current_mode)
     app = Application(layout=layout, key_bindings=key_bindings, full_screen=True)
     return app
 
 
-def _create_async_tasks(app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer):
+def _create_async_tasks(app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream):
     """Creates and returns all background asyncio tasks."""
     pty_reader_task = asyncio.create_task(
         _read_from_pty(app, pty_fd, pyte_stream, log_queue)
     )
     monitor_reader_task = asyncio.create_task(
-        _read_from_monitor(monitor_sock, log_queue)
+        _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue)
     )
     merger_task = asyncio.create_task(_log_merger(log_queue, log_buffer, app))
     return [pty_reader_task, monitor_reader_task, merger_task]
@@ -475,6 +495,8 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         current_mode,
         pyte_screen,
         pyte_stream,
+        monitor_pyte_screen,
+        monitor_pyte_stream,
     ) = _initialize_console_state()
 
     try:
@@ -485,11 +507,11 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
     monitor_sock = await _connect_to_monitor(monitor_socket_path)
 
     app = _setup_console_app(
-        current_mode, log_queue, pty_fd, monitor_sock, log_buffer, pyte_screen
+        current_mode, pty_fd, monitor_sock, log_buffer, pyte_screen, monitor_pyte_screen
     )
 
     tasks = _create_async_tasks(
-        app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer
+        app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream
     )
 
     return await _manage_console_session(
