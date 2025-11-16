@@ -58,6 +58,11 @@ class AnsiColorProcessor(Processor):
                 new_fragments.append(("", "\n"))
         return new_fragments
 
+    def _update_fragments_from_new_text(self, new_raw_text: str):
+        """Processes new text and updates the internal fragment cache."""
+        new_fragments = self._process_new_text_to_fragments(new_raw_text)
+        self._parsed_fragments.extend(new_fragments)
+
     def apply_transformation(
         self, transformation_input: TransformationInput
     ) -> Transformation:
@@ -72,8 +77,7 @@ class AnsiColorProcessor(Processor):
 
         new_raw_text = full_text[self._last_raw_length :]
         if new_raw_text:
-            new_fragments = self._process_new_text_to_fragments(new_raw_text)
-            self._parsed_fragments.extend(new_fragments)
+            self._update_fragments_from_new_text(new_raw_text)
             self._last_raw_length = current_length
 
         return Transformation(self._parsed_fragments)
@@ -175,9 +179,9 @@ async def _connect_to_monitor(monitor_socket_path):
         return None
 
 
-async def _handle_control_menu(app, current_mode, log_queue, monitor_sock):
-    """Displays the control menu and handles the user's choice."""
-    result = await button_dialog(
+async def _show_control_menu():
+    """Displays the control menu and returns the user's choice."""
+    return await button_dialog(
         title="Control Menu",
         text="Select an action:",
         buttons=[
@@ -187,23 +191,51 @@ async def _handle_control_menu(app, current_mode, log_queue, monitor_sock):
         ],
     ).run_async()
 
+
+async def _handle_quit_action(app, monitor_sock):
+    """Handles the 'quit' action from the control menu."""
+    if monitor_sock:
+        try:
+            monitor_sock.send(b"quit\n")
+            await asyncio.sleep(0.1)
+        except OSError:
+            pass  # Socket might be closed
+    app.exit(result="User quit")
+
+
+async def _handle_monitor_action(app, current_mode, log_queue):
+    """Handles the 'monitor' action from the control menu."""
+    current_mode[0] = app_config.MODE_QEMU_MONITOR
+    await log_queue.put(
+        "\n--- Switched to QEMU Monitor (Ctrl-] for menu) ---\n"
+    )
+    app.invalidate()
+
+
+async def _handle_resume_action(app, current_mode):
+    """Handles the 'resume' action from the control menu."""
+    current_mode[0] = app_config.MODE_SERIAL_CONSOLE
+    app.invalidate()
+
+
+async def _process_control_menu_choice(
+    result, app, current_mode, log_queue, monitor_sock
+):
+    """Handles the action selected from the control menu."""
     if result == "quit":
-        if monitor_sock:
-            try:
-                monitor_sock.send(b"quit\n")
-                await asyncio.sleep(0.1)
-            except OSError:
-                pass  # Socket might be closed
-        app.exit(result="User quit")
+        await _handle_quit_action(app, monitor_sock)
     elif result == "monitor":
-        current_mode[0] = app_config.MODE_QEMU_MONITOR
-        await log_queue.put(
-            "\n--- Switched to QEMU Monitor (Ctrl-] for menu) ---\n"
-        )
-        app.invalidate()
+        await _handle_monitor_action(app, current_mode, log_queue)
     else:  # resume
-        current_mode[0] = app_config.MODE_SERIAL_CONSOLE
-        app.invalidate()
+        await _handle_resume_action(app, current_mode)
+
+
+async def _handle_control_menu(app, current_mode, log_queue, monitor_sock):
+    """Displays the control menu and handles the user's choice."""
+    result = await _show_control_menu()
+    await _process_control_menu_choice(
+        result, app, current_mode, log_queue, monitor_sock
+    )
 
 
 async def _forward_input(event, current_mode, pty_fd, monitor_sock):
@@ -260,6 +292,24 @@ async def _log_task_error(log_queue: Queue, task_name: str, error_type: str = "E
     await log_queue.put(f"\n--- {task_name} {error_type} ---\n{tb_str}")
 
 
+def _process_pty_data(data, app, pyte_stream):
+    """Feeds PTY data to the stream and invalidates the app."""
+    pyte_stream.feed(data)
+    app.invalidate()
+
+
+async def _handle_pty_read_error(e, log_queue):
+    """Handles exceptions during PTY read operations."""
+    # Gracefully handle expected I/O error on shutdown when QEMU quits.
+    if isinstance(e, OSError) and e.errno == 5:
+        return True  # Indicates loop should break
+
+    # For any other exception, log it as a crash.
+    await _log_task_error(log_queue, "PTY READER", "CRASHED")
+    # Don't exit, allow monitor to be used for diagnostics.
+    return False  # Indicates function should return
+
+
 async def _read_from_pty(app, pty_fd, pyte_stream, log_queue):
     """Reads data from the PTY, feeds it to the terminal emulator, and invalidates the app."""
     loop = asyncio.get_running_loop()
@@ -269,17 +319,19 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue):
             if not data:
                 app.exit(result="PTY closed")
                 return
-            pyte_stream.feed(data)
-            app.invalidate()
+            _process_pty_data(data, app, pyte_stream)
         except Exception as e:
-            # Gracefully handle expected I/O error on shutdown when QEMU quits.
-            if isinstance(e, OSError) and e.errno == 5:
+            should_break = await _handle_pty_read_error(e, log_queue)
+            if should_break:
                 break
+            else:
+                return
 
-            # For any other exception, log it as a crash.
-            await _log_task_error(log_queue, "PTY READER", "CRASHED")
-            # Don't exit, allow monitor to be used for diagnostics.
-            return
+
+async def _process_monitor_data(data, log_queue):
+    """Decodes monitor data and puts it in the log queue."""
+    text = data.decode("utf-8", errors="replace")
+    await log_queue.put(text)
 
 
 async def _read_from_monitor(monitor_sock, log_queue):
@@ -292,8 +344,7 @@ async def _read_from_monitor(monitor_sock, log_queue):
             data = await loop.sock_recv(monitor_sock, 4096)
             if not data:
                 return  # Monitor connection closed, but don't exit app
-            text = data.decode("utf-8", errors="replace")
-            await log_queue.put(text)
+            await _process_monitor_data(data, log_queue)
         except Exception:
             await _log_task_error(log_queue, "MONITOR", "ERROR")
             return
@@ -396,6 +447,23 @@ async def _run_application_loop(app, pty_device, current_mode, pty_fd):
     print(f"Exiting console session: {result}")
 
 
+async def _manage_console_session(
+    app, pty_device, current_mode, pty_fd, qemu_process, tasks, monitor_sock
+):
+    """Runs the application loop, handles errors, and performs cleanup."""
+    return_code = 0
+    try:
+        await _run_application_loop(app, pty_device, current_mode, pty_fd)
+    except Exception as e:
+        print(f"Error running prompt_toolkit application: {e}", file=sys.stderr)
+        return_code = 1
+    finally:
+        _cleanup_console(qemu_process, tasks, pty_fd, monitor_sock)
+        return_code = qemu_process.returncode or 0
+
+    return return_code
+
+
 async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_path):
     """Manages a prompt_toolkit-based text console session for QEMU."""
     (
@@ -421,14 +489,6 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer
     )
 
-    return_code = 0
-    try:
-        await _run_application_loop(app, pty_device, current_mode, pty_fd)
-    except Exception as e:
-        print(f"Error running prompt_toolkit application: {e}", file=sys.stderr)
-        return_code = 1
-    finally:
-        _cleanup_console(qemu_process, tasks, pty_fd, monitor_sock)
-        return_code = qemu_process.returncode or 0
-
-    return return_code
+    return await _manage_console_session(
+        app, pty_device, current_mode, pty_fd, qemu_process, tasks, monitor_sock
+    )
