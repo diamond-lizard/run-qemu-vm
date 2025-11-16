@@ -305,6 +305,23 @@ def _get_direct_boot_kernel_cmdline(config):
     return "console=ttyS0,115200n8 panic=1"
 
 
+def _execute_7z_extraction(seven_zip_executable, iso_path, temp_dir, extract_path):
+    """Executes the 7z command to extract a file from an ISO."""
+    return subprocess.run(
+        [seven_zip_executable, "e", iso_path, f"-o{temp_dir}", extract_path],
+        capture_output=True, text=True, check=False
+    )
+
+
+def _handle_7z_extraction_result(result, output_path, extract_path):
+    """Checks the result of a 7z extraction and raises an error on failure."""
+    if result.returncode != 0 or not os.path.exists(output_path):
+        print(f"Error: Failed to extract '{extract_path}' from ISO.", file=sys.stderr)
+        if os.environ.get("DEBUG"):
+            print(f"Debug: 7z output: {result.stdout}\nDebug: 7z errors: {result.stderr}", file=sys.stderr)
+        raise RuntimeError(f"Failed to extract {extract_path}")
+
+
 def _extract_single_file_from_iso(seven_zip_executable, iso_path, file_in_iso, temp_dir):
     """Extracts a single file from an ISO into a temporary directory."""
     base_name = os.path.basename(file_in_iso)
@@ -314,16 +331,8 @@ def _extract_single_file_from_iso(seven_zip_executable, iso_path, file_in_iso, t
     if os.environ.get("DEBUG"):
         print(f"Debug: Extracting '{extract_path}' from ISO to '{output_path}'")
 
-    result = subprocess.run(
-        [seven_zip_executable, "e", iso_path, f"-o{temp_dir}", extract_path],
-        capture_output=True, text=True, check=False
-    )
-
-    if result.returncode != 0 or not os.path.exists(output_path):
-        print(f"Error: Failed to extract '{extract_path}' from ISO.", file=sys.stderr)
-        if os.environ.get("DEBUG"):
-            print(f"Debug: 7z output: {result.stdout}\nDebug: 7z errors: {result.stderr}", file=sys.stderr)
-        raise RuntimeError(f"Failed to extract {extract_path}")
+    result = _execute_7z_extraction(seven_zip_executable, iso_path, temp_dir, extract_path)
+    _handle_7z_extraction_result(result, output_path, extract_path)
 
     print(f"Info: Extracted {base_name} to: {output_path}")
     return output_path
