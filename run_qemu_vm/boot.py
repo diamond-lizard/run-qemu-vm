@@ -92,94 +92,93 @@ def _get_kernel_initrd_patterns():
     return kernel_patterns, initrd_patterns
 
 
-def _get_isoinfo_blocks(listing_output):
-    """Splits the isoinfo listing into directory blocks."""
-    return [block.strip() for block in listing_output.split("\n\n") if block.strip()]
+class _IsoInfoParser:
+    """Parses `isoinfo -l -R` output to find kernel and initrd candidates."""
 
+    def __init__(self, kernel_patterns, initrd_patterns):
+        self.kernel_patterns = kernel_patterns
+        self.initrd_patterns = initrd_patterns
+        self._candidate_kernels = []
+        self._candidate_initrds = []
 
-def _parse_directory_from_block_header(block_lines):
-    """Parses the directory path from the header of an isoinfo block."""
-    dir_header = next((line for line in block_lines if line.startswith("Directory listing of")), None)
-    if not dir_header:
-        return None
-    try:
-        # e.g., "Directory listing of /isolinux':"
-        return dir_header.split()[-1].strip("'").strip(":")
-    except IndexError:
-        if os.environ.get("DEBUG"):
-            print(f"Debug: Could not parse directory from header: {dir_header}")
-        return None
+    def parse(self, listing_output):
+        """Parses the full listing and returns kernel/initrd candidates."""
+        for block in self._get_blocks(listing_output):
+            self._process_block(block)
+        return self._candidate_kernels, self._candidate_initrds
 
+    def _get_blocks(self, listing_output):
+        """Splits the isoinfo listing into directory blocks."""
+        return [block.strip() for block in listing_output.split("\n\n") if block.strip()]
 
-def _parse_file_info_from_line(line):
-    """
-    Parses a file line from isoinfo output, returning filename and size.
-    Returns (None, None) if the line is not a valid file entry.
-    """
-    if not line.startswith('-r-'):
-        return None, None
-    parts = line.split()
-    if len(parts) < 10:
-        return None, None
-    try:
-        filename = parts[-1]
-        if filename in ('.', '..'):
-            return None, None
-        file_size = int(parts[4])
-        return filename, file_size
-    except (ValueError, IndexError) as e:
-        if os.environ.get("DEBUG"):
-            print(f"Debug: Skipping malformed ISO line: {line} ({e})")
-        return None, None
+    def _process_block(self, block):
+        """Processes a single directory block from the listing."""
+        lines = block.splitlines()
+        current_directory = self._parse_directory_from_header(lines)
+        if not current_directory:
+            return
 
+        for line in lines:
+            self._process_file_line(line, current_directory)
 
-def _yield_candidate_if_match(full_path, file_size, patterns, candidate_type):
-    """Yields a candidate tuple if the path matches any of the given patterns."""
-    lower_path = full_path.lower()
-    for pattern in patterns:
-        if re.search(pattern, lower_path):
+    def _parse_directory_from_header(self, block_lines):
+        """Parses the directory path from the header of an isoinfo block."""
+        dir_header = next((line for line in block_lines if line.startswith("Directory listing of")), None)
+        if not dir_header:
+            return None
+        try:
+            # e.g., "Directory listing of /isolinux':"
+            return dir_header.split()[-1].strip("'").strip(":")
+        except IndexError:
             if os.environ.get("DEBUG"):
-                print(f"Debug: {candidate_type.capitalize()} candidate: {full_path} (size:{file_size})")
-            yield candidate_type, (full_path, file_size)
-            break
+                print(f"Debug: Could not parse directory from header: {dir_header}")
+            return None
 
+    def _process_file_line(self, line, current_directory):
+        """Parses a file line and adds kernel/initrd candidates if found."""
+        filename, file_size = self._parse_file_info_from_line(line)
+        if not filename or not file_size or file_size < 100_000:
+            return
 
-def _process_file_line(line, current_directory, kernel_patterns, initrd_patterns):
-    """Parses a file line and yields kernel/initrd candidates if found."""
-    filename, file_size = _parse_file_info_from_line(line)
-    if not filename or not file_size or file_size < 100_000:
-        return
+        full_path = os.path.join('/', current_directory, filename).replace('\\', '/').replace('//', '/')
 
-    full_path = os.path.join('/', current_directory, filename).replace('\\', '/').replace('//', '/')
+        self._add_candidate_if_match(full_path, file_size, self.kernel_patterns, 'kernel')
+        self._add_candidate_if_match(full_path, file_size, self.initrd_patterns, 'initrd')
 
-    yield from _yield_candidate_if_match(full_path, file_size, kernel_patterns, 'kernel')
-    yield from _yield_candidate_if_match(full_path, file_size, initrd_patterns, 'initrd')
+    def _parse_file_info_from_line(self, line):
+        """
+        Parses a file line from isoinfo output, returning filename and size.
+        Returns (None, None) if the line is not a valid file entry.
+        """
+        if not line.startswith('-r-'):
+            return None, None
+        parts = line.split()
+        if len(parts) < 10:
+            return None, None
+        try:
+            filename = parts[-1]
+            if filename in ('.', '..'):
+                return None, None
+            file_size = int(parts[4])
+            return filename, file_size
+        except (ValueError, IndexError) as e:
+            if os.environ.get("DEBUG"):
+                print(f"Debug: Skipping malformed ISO line: {line} ({e})")
+            return None, None
 
+    def _add_candidate_if_match(self, full_path, file_size, patterns, candidate_type):
+        """Adds a candidate tuple if the path matches any of the given patterns."""
+        lower_path = full_path.lower()
+        for pattern in patterns:
+            if re.search(pattern, lower_path):
+                if os.environ.get("DEBUG"):
+                    print(f"Debug: {candidate_type.capitalize()} candidate: {full_path} (size:{file_size})")
 
-def _find_candidates_in_block(block, kernel_patterns, initrd_patterns):
-    """Yields kernel and initrd candidates found in a single isoinfo block."""
-    lines = block.splitlines()
-    current_directory = _parse_directory_from_block_header(lines)
-    if not current_directory:
-        return
-
-    for line in lines:
-        yield from _process_file_line(line, current_directory, kernel_patterns, initrd_patterns)
-
-
-def _parse_isoinfo_listing(listing_output, kernel_patterns, initrd_patterns):
-    """Parses the output of 'isoinfo -l' to find kernel/initrd candidates."""
-    candidate_kernels = []
-    candidate_initrds = []
-
-    for block in _get_isoinfo_blocks(listing_output):
-        for candidate_type, candidate_data in _find_candidates_in_block(block, kernel_patterns, initrd_patterns):
-            if candidate_type == 'kernel':
-                candidate_kernels.append(candidate_data)
-            elif candidate_type == 'initrd':
-                candidate_initrds.append(candidate_data)
-
-    return candidate_kernels, candidate_initrds
+                if candidate_type == 'kernel':
+                    self._candidate_kernels.append((full_path, file_size))
+                elif candidate_type == 'initrd':
+                    self._candidate_initrds.append((full_path, file_size))
+                break
 
 
 def _get_isoinfo_listing_output(isoinfo_path, iso_path):
@@ -222,7 +221,8 @@ def _find_kernel_initrd_with_isoinfo(iso_path, kernel_patterns, initrd_patterns)
     if error:
         return None, None, error
 
-    candidate_kernels, candidate_initrds = _parse_isoinfo_listing(listing_output, kernel_patterns, initrd_patterns)
+    parser = _IsoInfoParser(kernel_patterns, initrd_patterns)
+    candidate_kernels, candidate_initrds = parser.parse(listing_output)
 
     found_kernel, found_initrd = _select_best_boot_candidates(candidate_kernels, candidate_initrds)
 
@@ -409,6 +409,34 @@ def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
     return _handle_uefi_bootloader_not_found(tools_tried, patterns)
 
 
+def _try_isoinfo_for_kernel_initrd(iso_path, kernel_patterns, initrd_patterns):
+    """
+    Attempts to find kernel and initrd using isoinfo.
+    Returns (kernel, initrd, reason) on success, or (None, None, reason) on failure.
+    The reason is for logging.
+    """
+    kernel, initrd, reason = _find_kernel_initrd_with_isoinfo(iso_path, kernel_patterns, initrd_patterns)
+    if kernel and initrd:
+        # isoinfo provides full paths, which is what we need for extraction on Linux.
+        # For other platforms, we historically stripped the leading slash.
+        if platform.system() == 'Linux':
+            return kernel, initrd, reason
+        return kernel.lstrip('/'), initrd.lstrip('/'), reason
+    return None, None, reason
+
+
+def _try_7z_for_kernel_initrd(seven_zip_executable, iso_path, kernel_patterns, initrd_patterns):
+    """
+    Attempts to find kernel and initrd using 7z.
+    Returns (kernel, initrd, reason) on success, or (None, None, reason) on failure.
+    The reason is for logging.
+    """
+    kernel, initrd, reason = _find_kernel_initrd_with_7z(seven_zip_executable, iso_path, kernel_patterns, initrd_patterns)
+    if kernel and initrd:
+        return kernel.lstrip('/'), initrd.lstrip('/'), reason
+    return None, None, reason
+
+
 def _warn_kernel_initrd_not_found(tools_tried):
     """Prints a warning that kernel/initrd could not be found."""
     return _warn_kernel_initrd_not_found(tools_tried)
@@ -425,19 +453,15 @@ def find_kernel_and_initrd(seven_zip_executable, iso_path):
 
     # --- Attempt 1: isoinfo (preferred) ---
     if shutil.which("isoinfo"):
-        kernel, initrd, reason = _find_kernel_initrd_with_isoinfo(iso_path, kernel_patterns, initrd_patterns)
+        kernel, initrd, reason = _try_isoinfo_for_kernel_initrd(iso_path, kernel_patterns, initrd_patterns)
         if kernel and initrd:
-            # isoinfo provides full paths, which is what we need for extraction on Linux.
-            # For other platforms, we historically stripped the leading slash.
-            if platform.system() == 'Linux':
-                return kernel, initrd
-            return kernel.lstrip('/'), initrd.lstrip('/')
+            return kernel, initrd
         tools_tried.append(reason)
 
     # --- Attempt 2: 7z fallback ---
-    kernel, initrd, reason = _find_kernel_initrd_with_7z(seven_zip_executable, iso_path, kernel_patterns, initrd_patterns)
+    kernel, initrd, reason = _try_7z_for_kernel_initrd(seven_zip_executable, iso_path, kernel_patterns, initrd_patterns)
     if kernel and initrd:
-        return kernel.lstrip('/'), initrd.lstrip('/')
+        return kernel, initrd
     tools_tried.append(reason)
 
     print(f"Warning: Could not find a suitable Linux kernel and initial ramdisk (initrd) in the ISO for direct boot. Tried: {', '.join(tools_tried)}", file=sys.stderr)
