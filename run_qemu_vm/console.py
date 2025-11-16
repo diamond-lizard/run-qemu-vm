@@ -73,6 +73,251 @@ class AnsiColorProcessor(Processor):
         return Transformation(self._parsed_fragments)
 
 
+def _get_char_style(char):
+    """Generates a prompt_toolkit style string from a pyte character."""
+    style_parts = []
+
+    # Foreground color
+    fg = char.get("fg", "default")
+    if fg.startswith("#"):
+        style_parts.append(fg)
+    elif fg != "default":
+        style_parts.append(f"fg:ansi{fg}")
+
+    # Background color
+    bg = char.get("bg", "default")
+    if bg.startswith("#"):
+        style_parts.append(f"bg:{bg}")
+    elif bg != "default":
+        style_parts.append(f"bg:ansi{bg}")
+
+    # Attributes
+    if char.get("bold"):
+        style_parts.append("bold")
+    if char.get("italics"):
+        style_parts.append("italic")
+    if char.get("underline"):
+        style_parts.append("underline")
+    if char.get("reverse"):
+        style_parts.append("reverse")
+
+    return " ".join(style_parts)
+
+
+def _process_line_to_fragments(y, pyte_screen):
+    """Processes a single line from the pyte screen into fragments."""
+    line_fragments = []
+    current_text = ""
+    current_style = ""  # Start with an empty style string
+    for x in range(pyte_screen.columns):
+        char = pyte_screen.buffer[y, x]
+        style_str = _get_char_style(char)
+
+        # The `pyte.Char` object is `char['data']`. Its `data` attribute holds the character.
+        char_data = char["data"].data
+
+        if style_str == current_style:
+            current_text += char_data
+        else:
+            if current_text:
+                line_fragments.append((current_style, current_text))
+            current_style = style_str
+            current_text = char_data
+
+    if current_text:
+        line_fragments.append((current_style, current_text))
+
+    return line_fragments
+
+
+def _get_pty_screen_fragments(pyte_screen):
+    """Converts the entire pyte screen state into prompt_toolkit fragments."""
+    fragments = []
+    for y in range(pyte_screen.lines):
+        line_fragments = _process_line_to_fragments(y, pyte_screen)
+        fragments.extend(line_fragments)
+        fragments.append(("", "\n"))
+    return fragments
+
+
+def _append_to_log(log_buffer: Buffer, text_to_append: str):
+    """Appends text to the log buffer, bypassing the read-only protection."""
+    current_doc = log_buffer.document
+    new_text = current_doc.text + text_to_append
+    new_doc = Document(text=new_text, cursor_position=len(new_text))
+    log_buffer.set_document(new_doc, bypass_readonly=True)
+
+
+def _open_pty_device(pty_device):
+    """Opens the PTY device file descriptor, returning it or raising FileNotFoundError."""
+    try:
+        return os.open(pty_device, os.O_RDWR | os.O_NOCTTY)
+    except FileNotFoundError:
+        print(f"Error: PTY device '{pty_device}' not found.", file=sys.stderr)
+        raise
+
+
+async def _connect_to_monitor(monitor_socket_path):
+    """Establishes a non-blocking connection to the QEMU monitor socket."""
+    monitor_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    monitor_sock.setblocking(False)
+    try:
+        await asyncio.get_running_loop().sock_connect(monitor_sock, monitor_socket_path)
+        return monitor_sock
+    except (FileNotFoundError, ConnectionRefusedError):
+        print("Warning: Could not connect to QEMU monitor.", file=sys.stderr)
+        return None
+
+
+async def _handle_control_menu(app, current_mode, log_queue, monitor_sock):
+    """Displays the control menu and handles the user's choice."""
+    result = await button_dialog(
+        title="Control Menu",
+        text="Select an action:",
+        buttons=[
+            ("Resume Console", "resume"),
+            ("Enter Monitor", "monitor"),
+            ("Quit QEMU", "quit"),
+        ],
+    ).run_async()
+
+    if result == "quit":
+        if monitor_sock:
+            try:
+                monitor_sock.send(b"quit\n")
+                await asyncio.sleep(0.1)
+            except OSError:
+                pass  # Socket might be closed
+        app.exit(result="User quit")
+    elif result == "monitor":
+        current_mode[0] = app_config.MODE_QEMU_MONITOR
+        await log_queue.put(
+            "\n--- Switched to QEMU Monitor (Ctrl-] for menu) ---\n"
+        )
+        app.invalidate()
+    else:  # resume
+        current_mode[0] = app_config.MODE_SERIAL_CONSOLE
+        app.invalidate()
+
+
+async def _forward_input(event, current_mode, pty_fd, monitor_sock):
+    """Forwards user input to the PTY or monitor based on the current mode."""
+    loop = asyncio.get_running_loop()
+    try:
+        if current_mode[0] == app_config.MODE_SERIAL_CONSOLE:
+            await loop.run_in_executor(
+                None, os.write, pty_fd, event.data.encode("utf-8", errors="replace")
+            )
+        elif current_mode[0] == app_config.MODE_QEMU_MONITOR and monitor_sock:
+            await loop.sock_sendall(
+                monitor_sock, event.data.encode("utf-8", errors="replace")
+            )
+    except OSError:
+        pass  # Ignore write errors if PTY/socket is closed
+
+
+def _create_key_bindings(current_mode, log_queue, pty_fd, monitor_sock):
+    """Creates and configures the key bindings for the console application."""
+    key_bindings = KeyBindings()
+
+    @key_bindings.add("c-]", eager=True)
+    async def _(event):
+        await _handle_control_menu(event.app, current_mode, log_queue, monitor_sock)
+
+    @key_bindings.add("<any>")
+    async def _(event):
+        await _forward_input(event, current_mode, pty_fd, monitor_sock)
+
+    return key_bindings
+
+
+def _create_console_layout(log_buffer, get_pty_screen_fragments, current_mode):
+    """Creates the prompt_toolkit layout for the console."""
+    is_serial_mode = Condition(lambda: current_mode[0] == app_config.MODE_SERIAL_CONSOLE)
+
+    pty_control = FormattedTextControl(text=get_pty_screen_fragments)
+    pty_container = ConditionalContainer(
+        Window(content=pty_control, dont_extend_height=True), filter=is_serial_mode
+    )
+
+    log_control = BufferControl(buffer=log_buffer, input_processors=[AnsiColorProcessor()])
+    monitor_container = ConditionalContainer(
+        Window(content=log_control, wrap_lines=True), filter=~is_serial_mode
+    )
+
+    return Layout(HSplit([pty_container, monitor_container]))
+
+
+async def _read_from_pty(app, pty_fd, pyte_stream, log_queue):
+    """Reads data from the PTY, feeds it to the terminal emulator, and invalidates the app."""
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            data = await loop.run_in_executor(None, os.read, pty_fd, 4096)
+            if not data:
+                app.exit(result="PTY closed")
+                return
+            pyte_stream.feed(data)
+            app.invalidate()
+        except Exception as e:
+            # Gracefully handle expected I/O error on shutdown when QEMU quits.
+            if isinstance(e, OSError) and e.errno == 5:
+                break
+
+            # For any other exception, log it as a crash.
+            tb_str = traceback.format_exc()
+            await log_queue.put(f"\n--- PTY READER CRASHED ---\n{tb_str}")
+            # Don't exit, allow monitor to be used for diagnostics.
+            return
+
+
+async def _read_from_monitor(monitor_sock, log_queue):
+    """Reads data from the QEMU monitor socket and puts it in the log queue."""
+    if not monitor_sock:
+        return
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            data = await loop.sock_recv(monitor_sock, 4096)
+            if not data:
+                return  # Monitor connection closed, but don't exit app
+            text = data.decode("utf-8", errors="replace")
+            await log_queue.put(text)
+        except Exception:
+            tb_str = traceback.format_exc()
+            await log_queue.put(f"\n--- MONITOR ERROR ---\n{tb_str}")
+            return
+
+
+async def _log_merger(log_queue, log_buffer, app):
+    """Merges log messages from a queue into the log buffer."""
+    while True:
+        try:
+            text = await log_queue.get()
+            _append_to_log(log_buffer, text)
+            app.invalidate()
+            log_queue.task_done()
+        except asyncio.CancelledError:
+            break
+
+
+def _cleanup_console(qemu_process, tasks, pty_fd, monitor_sock):
+    """Cancels all running async tasks and closes open resources."""
+    for task in tasks:
+        task.cancel()
+
+    if pty_fd != -1:
+        os.close(pty_fd)
+    if monitor_sock:
+        monitor_sock.close()
+
+    try:
+        qemu_process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        qemu_process.kill()
+        qemu_process.wait()
+
+
 async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_path):
     """Manages a prompt_toolkit-based text console session for QEMU."""
     log_queue = Queue()
@@ -86,195 +331,30 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
     pyte_stream = pyte.ByteStream(pyte_screen)
 
     def get_pty_screen_fragments():
-        """Converts the pyte screen state into prompt_toolkit fragments."""
-        fragments = []
-        for y in range(pyte_screen.lines):
-            line_fragments = []
-            current_text = ""
-            current_style = ""  # Start with an empty style string
-            for x in range(pyte_screen.columns):
-                char = pyte_screen.buffer[y, x]
-                style_parts = []
-
-                # Foreground color
-                fg = char.get("fg", "default")
-                if fg.startswith("#"):
-                    style_parts.append(fg)
-                elif fg != "default":
-                    style_parts.append(f"fg:ansi{fg}")
-
-                # Background color
-                bg = char.get("bg", "default")
-                if bg.startswith("#"):
-                    style_parts.append(f"bg:{bg}")
-                elif bg != "default":
-                    style_parts.append(f"bg:ansi{bg}")
-
-                # Attributes
-                if char.get("bold"):
-                    style_parts.append("bold")
-                if char.get("italics"):
-                    style_parts.append("italic")
-                if char.get("underline"):
-                    style_parts.append("underline")
-                if char.get("reverse"):
-                    style_parts.append("reverse")
-
-                style_str = " ".join(style_parts)
-
-                # The `pyte.Char` object is `char['data']`. Its `data` attribute holds the character.
-                char_data = char["data"].data
-
-                if style_str == current_style:
-                    current_text += char_data
-                else:
-                    if current_text:
-                        line_fragments.append((current_style, current_text))
-                    current_style = style_str
-                    current_text = char_data
-
-            if current_text:
-                line_fragments.append((current_style, current_text))
-
-            fragments.extend(line_fragments)
-            fragments.append(("", "\n"))
-        return fragments
+        """Wrapper to pass pyte_screen to the fragment generator."""
+        return _get_pty_screen_fragments(pyte_screen)
 
     def append_to_log(text_to_append: str):
-        """Appends text to the log buffer, bypassing the read-only protection."""
-        current_doc = log_buffer.document
-        new_text = current_doc.text + text_to_append
-        new_doc = Document(text=new_text, cursor_position=len(new_text))
-        log_buffer.set_document(new_doc, bypass_readonly=True)
+        """Wrapper to pass log_buffer to the append helper."""
+        _append_to_log(log_buffer, text_to_append)
 
     try:
-        pty_fd = os.open(pty_device, os.O_RDWR | os.O_NOCTTY)
+        pty_fd = _open_pty_device(pty_device)
     except FileNotFoundError:
-        print(f"Error: PTY device '{pty_device}' not found.", file=sys.stderr)
         return 1
 
-    monitor_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    monitor_sock.setblocking(False)
-    try:
-        await asyncio.get_running_loop().sock_connect(monitor_sock, monitor_socket_path)
-    except (FileNotFoundError, ConnectionRefusedError):
-        print("Warning: Could not connect to QEMU monitor.", file=sys.stderr)
-        monitor_sock = None  # Disable monitor functionality
+    monitor_sock = await _connect_to_monitor(monitor_socket_path)
 
-    key_bindings = KeyBindings()
-
-    @key_bindings.add("c-]", eager=True)
-    async def _(event):
-        app = event.app
-        result = await button_dialog(
-            title="Control Menu",
-            text="Select an action:",
-            buttons=[
-                ("Resume Console", "resume"),
-                ("Enter Monitor", "monitor"),
-                ("Quit QEMU", "quit"),
-            ],
-        ).run_async()
-
-        if result == "quit":
-            if monitor_sock:
-                try:
-                    monitor_sock.send(b"quit\n")
-                    await asyncio.sleep(0.1)
-                except OSError:
-                    pass  # Socket might be closed
-            app.exit(result="User quit")
-        elif result == "monitor":
-            current_mode[0] = app_config.MODE_QEMU_MONITOR
-            await log_queue.put(
-                "\n--- Switched to QEMU Monitor (Ctrl-] for menu) ---\n"
-            )
-            app.invalidate()
-        else:  # resume
-            current_mode[0] = app_config.MODE_SERIAL_CONSOLE
-            app.invalidate()
-
-    @key_bindings.add("<any>")
-    async def _(event):
-        loop = asyncio.get_running_loop()
-        try:
-            if current_mode[0] == app_config.MODE_SERIAL_CONSOLE:
-                await loop.run_in_executor(
-                    None, os.write, pty_fd, event.data.encode("utf-8", errors="replace")
-                )
-            elif current_mode[0] == app_config.MODE_QEMU_MONITOR and monitor_sock:
-                await loop.sock_sendall(
-                    monitor_sock, event.data.encode("utf-8", errors="replace")
-                )
-        except OSError:
-            pass  # Ignore write errors if PTY/socket is closed
-
-    is_serial_mode = Condition(lambda: current_mode[0] == app_config.MODE_SERIAL_CONSOLE)
-
-    pty_control = FormattedTextControl(text=get_pty_screen_fragments)
-    pty_container = ConditionalContainer(
-        Window(content=pty_control, dont_extend_height=True), filter=is_serial_mode
-    )
-
-    log_control = BufferControl(buffer=log_buffer, input_processors=[AnsiColorProcessor()])
-    monitor_container = ConditionalContainer(
-        Window(content=log_control, wrap_lines=True), filter=~is_serial_mode
-    )
-
-    layout = Layout(HSplit([pty_container, monitor_container]))
+    key_bindings = _create_key_bindings(current_mode, log_queue, pty_fd, monitor_sock)
+    layout = _create_console_layout(log_buffer, get_pty_screen_fragments, current_mode)
     app = Application(layout=layout, key_bindings=key_bindings, full_screen=True)
 
-    async def read_from_pty():
-        loop = asyncio.get_running_loop()
-        while True:
-            try:
-                data = await loop.run_in_executor(None, os.read, pty_fd, 4096)
-                if not data:
-                    app.exit(result="PTY closed")
-                    return
-                pyte_stream.feed(data)
-                app.invalidate()
-            except Exception as e:
-                # Gracefully handle expected I/O error on shutdown when QEMU quits.
-                if isinstance(e, OSError) and e.errno == 5:
-                    break
-
-                # For any other exception, log it as a crash.
-                tb_str = traceback.format_exc()
-                await log_queue.put(f"\n--- PTY READER CRASHED ---\n{tb_str}")
-                # Don't exit, allow monitor to be used for diagnostics.
-                return
-
-    async def read_from_monitor():
-        if not monitor_sock:
-            return
-        loop = asyncio.get_running_loop()
-        while True:
-            try:
-                data = await loop.sock_recv(monitor_sock, 4096)
-                if not data:
-                    return  # Monitor connection closed, but don't exit app
-                text = data.decode("utf-8", errors="replace")
-                await log_queue.put(text)
-            except Exception:
-                tb_str = traceback.format_exc()
-                await log_queue.put(f"\n--- MONITOR ERROR ---\n{tb_str}")
-                return
-
-    async def log_merger():
-        """The single writer task that safely merges logs into the buffer."""
-        while True:
-            try:
-                text = await log_queue.get()
-                append_to_log(text)
-                app.invalidate()
-                log_queue.task_done()
-            except asyncio.CancelledError:
-                break
-
-    pty_reader_task = asyncio.create_task(read_from_pty())
-    monitor_reader_task = asyncio.create_task(read_from_monitor())
-    merger_task = asyncio.create_task(log_merger())
+    pty_reader_task = asyncio.create_task(
+        _read_from_pty(app, pty_fd, pyte_stream, log_queue)
+    )
+    monitor_reader_task = asyncio.create_task(_read_from_monitor(monitor_sock, log_queue))
+    merger_task = asyncio.create_task(_log_merger(log_queue, log_buffer, app))
+    tasks = [pty_reader_task, monitor_reader_task, merger_task]
 
     return_code = 0
     try:
@@ -294,20 +374,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         print(f"Error running prompt_toolkit application: {e}", file=sys.stderr)
         return_code = 1
     finally:
-        pty_reader_task.cancel()
-        monitor_reader_task.cancel()
-        merger_task.cancel()
-        if pty_fd != -1:
-            os.close(pty_fd)
-        if monitor_sock:
-            monitor_sock.close()
-
-        try:
-            qemu_process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            qemu_process.kill()
-            qemu_process.wait()
-
+        _cleanup_console(qemu_process, tasks, pty_fd, monitor_sock)
         return_code = qemu_process.returncode or 0
 
     return return_code
