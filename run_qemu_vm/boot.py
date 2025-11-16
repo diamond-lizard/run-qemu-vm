@@ -232,36 +232,67 @@ def _find_kernel_initrd_with_isoinfo(iso_path, kernel_patterns, initrd_patterns)
         return None, None, "isoinfo (candidates not found)"
 
 
-def _find_kernel_initrd_with_7z(seven_zip_executable, iso_path, kernel_patterns, initrd_patterns):
-    """Tries to find kernel and initrd in an ISO using 7z."""
+def _get_7z_listing(seven_zip_executable, iso_path):
+    """Runs 7z to get a file listing of an ISO."""
     try:
         result = subprocess.run([seven_zip_executable, 'l', iso_path], capture_output=True, text=True, check=True)
+        return result.stdout, None
     except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        return None, None, f"7z failed ({e})"
+        return None, f"7z failed ({e})"
 
+
+def _is_7z_kernel_candidate(path, patterns):
+    """Checks if a path from 7z output is a likely kernel candidate."""
+    lower_path = path.lower()
+    for pattern in patterns:
+        if pattern in lower_path and not lower_path.endswith('.mod') and lower_path.endswith(('bin', 'z', 'bimage', 'elf')):
+            return True
+    return False
+
+
+def _is_7z_initrd_candidate(path, patterns):
+    """Checks if a path from 7z output is a likely initrd candidate."""
+    lower_path = path.lower()
+    for pattern in patterns:
+        if pattern in lower_path and lower_path.endswith(('.img', '.gz')):
+            return True
+    return False
+
+
+def _parse_7z_listing_for_boot_files(listing_output, kernel_patterns, initrd_patterns):
+    """Parses 7z listing output to find the first kernel and initrd candidates."""
     found_kernel, found_initrd = None, None
-    for line in result.stdout.splitlines():
+    for line in listing_output.splitlines():
         parts = line.split()
         if len(parts) > 0:
             full_path = parts[-1].lstrip('./').replace('\\', '/')
-            lower_path = full_path.lower()
 
-            if not found_kernel:
-                for pattern in kernel_patterns:
-                    if pattern in lower_path and not lower_path.endswith('.mod') and lower_path.endswith(('bin', 'z', 'bimage', 'elf')):
-                        found_kernel = full_path
-                        break
+            if not found_kernel and _is_7z_kernel_candidate(full_path, kernel_patterns):
+                found_kernel = full_path
 
-            if not found_initrd:
-                for pattern in initrd_patterns:
-                    if pattern in lower_path and lower_path.endswith(('.img', '.gz')):
-                        found_initrd = full_path
-                        break
+            if not found_initrd and _is_7z_initrd_candidate(full_path, initrd_patterns):
+                found_initrd = full_path
 
             if found_kernel and found_initrd:
-                print(f"Info: Found Kernel: {found_kernel} (using 7z)")
-                print(f"Info: Found Initrd: {found_initrd} (using 7z)")
-                return found_kernel, found_initrd, "7z"
+                break  # Found both, no need to search further
+
+    return found_kernel, found_initrd
+
+
+def _find_kernel_initrd_with_7z(seven_zip_executable, iso_path, kernel_patterns, initrd_patterns):
+    """Tries to find kernel and initrd in an ISO using 7z."""
+    listing_output, error = _get_7z_listing(seven_zip_executable, iso_path)
+    if error:
+        return None, None, error
+
+    found_kernel, found_initrd = _parse_7z_listing_for_boot_files(
+        listing_output, kernel_patterns, initrd_patterns
+    )
+
+    if found_kernel and found_initrd:
+        print(f"Info: Found Kernel: {found_kernel} (using 7z)")
+        print(f"Info: Found Initrd: {found_initrd} (using 7z)")
+        return found_kernel, found_initrd, "7z"
 
     return None, None, "7z (not found)"
 
