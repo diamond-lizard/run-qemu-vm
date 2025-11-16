@@ -439,33 +439,47 @@ def _try_7z_for_kernel_initrd(seven_zip_executable, iso_path, kernel_patterns, i
 
 def _warn_kernel_initrd_not_found(tools_tried):
     """Prints a warning that kernel/initrd could not be found."""
-    return _warn_kernel_initrd_not_found(tools_tried)
+    print(f"Warning: Could not find a suitable Linux kernel and initial ramdisk (initrd) in the ISO for direct boot. Tried: {', '.join(tools_tried)}", file=sys.stderr)
+    print("Warning: Falling back to standard BIOS boot (direct kernel boot disabled).", file=sys.stderr)
+
+
+def _run_kernel_initrd_finders(finders):
+    """
+    Iterates through finder functions until one succeeds.
+
+    Each finder should return a tuple of (kernel, initrd, reason).
+    Returns a tuple of (kernel, initrd) on the first success.
+    If all finders fail, returns (None, None) and a list of failure reasons.
+    """
+    failure_reasons = []
+    for finder in finders:
+        kernel, initrd, reason = finder()
+        if kernel and initrd:
+            return kernel, initrd, []
+        if reason:
+            failure_reasons.append(reason)
+    return None, None, failure_reasons
 
 
 def find_kernel_and_initrd(seven_zip_executable, iso_path):
     """
     Inspects an ISO to find paths to a Linux kernel and initial ramdisk.
-    It tries 'isoinfo' first, then falls back to '7z'.
+    It tries a sequence of tools ('isoinfo', then '7z').
     """
     print(f"Info: Searching for kernel and initrd in '{iso_path}'...")
     kernel_patterns, initrd_patterns = _get_kernel_initrd_patterns()
-    tools_tried = []
 
-    # --- Attempt 1: isoinfo (preferred) ---
-    if shutil.which("isoinfo"):
-        kernel, initrd, reason = _try_isoinfo_for_kernel_initrd(iso_path, kernel_patterns, initrd_patterns)
-        if kernel and initrd:
-            return kernel, initrd
-        tools_tried.append(reason)
+    finders = [
+        lambda: _try_isoinfo_for_kernel_initrd(iso_path, kernel_patterns, initrd_patterns),
+        lambda: _try_7z_for_kernel_initrd(seven_zip_executable, iso_path, kernel_patterns, initrd_patterns),
+    ]
 
-    # --- Attempt 2: 7z fallback ---
-    kernel, initrd, reason = _try_7z_for_kernel_initrd(seven_zip_executable, iso_path, kernel_patterns, initrd_patterns)
+    kernel, initrd, reasons = _run_kernel_initrd_finders(finders)
+
     if kernel and initrd:
         return kernel, initrd
-    tools_tried.append(reason)
 
-    print(f"Warning: Could not find a suitable Linux kernel and initial ramdisk (initrd) in the ISO for direct boot. Tried: {', '.join(tools_tried)}", file=sys.stderr)
-    print("Warning: Falling back to standard BIOS boot (direct kernel boot disabled).", file=sys.stderr)
+    _warn_kernel_initrd_not_found(reasons)
     return None, None
 
 
