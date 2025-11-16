@@ -519,19 +519,27 @@ def _remove_cdrom_args(args):
     return args_copy
 
 
+def _extract_kernel_and_initrd(config, kernel_file, initrd_file, temp_dir):
+    """Extracts kernel and initrd from ISO to a temporary directory, exiting on failure."""
+    try:
+        extracted_files = dict(_extract_iso_files(
+            config["seven_zip_executable"], config["cdrom"],
+            [kernel_file, initrd_file], temp_dir
+        ))
+        kernel_path = extracted_files[kernel_file]
+        initrd_path = extracted_files[initrd_file]
+        return kernel_path, initrd_path
+    except (RuntimeError, KeyError) as e:
+        print(f"Error: Failed during file extraction from ISO: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def _run_direct_boot_linux(args, config, kernel_file, initrd_file, kernel_cmd_line):
     """Handles direct kernel boot on Linux by extracting files from the ISO."""
     with tempfile.TemporaryDirectory(prefix="qemu-kernel-") as temp_dir:
-        try:
-            extracted_files = dict(_extract_iso_files(
-                config["seven_zip_executable"], config["cdrom"],
-                [kernel_file, initrd_file], temp_dir
-            ))
-            kernel_path = extracted_files[kernel_file]
-            initrd_path = extracted_files[initrd_file]
-        except (RuntimeError, Exception) as e:
-            print(f"Error: Failed during file extraction from ISO: {e}", file=sys.stderr)
-            sys.exit(1)
+        kernel_path, initrd_path = _extract_kernel_and_initrd(
+            config, kernel_file, initrd_file, temp_dir
+        )
 
         args.extend(["-kernel", kernel_path, "-initrd", initrd_path])
         args.extend(["-append", kernel_cmd_line, "-nographic"])
