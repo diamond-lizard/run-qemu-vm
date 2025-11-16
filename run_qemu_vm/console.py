@@ -210,11 +210,11 @@ async def _handle_monitor_action(app, current_mode, monitor_sock):
     """Handles the 'monitor' action from the control menu."""
     # Switch mode first
     current_mode[0] = app_config.MODE_QEMU_MONITOR
-    
+
     # Force a full redraw
     app.invalidate()
     app.renderer.reset()
-    
+
     # Send a newline to trigger the monitor prompt to be displayed
     if monitor_sock:
         try:
