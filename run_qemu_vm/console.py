@@ -28,59 +28,33 @@ from . import config as app_config
 
 class AnsiColorProcessor(Processor):
     """
-    A processor that handles ANSI escape sequences and preserves newlines correctly.
-    Processes only new text appended to the buffer for performance.
+    A stateless processor that handles ANSI escape sequences.
+    It processes the entire buffer on each rendering pass to avoid state
+    corruption from partial ANSI sequences.
     """
-
-    def __init__(self):
-        self._parsed_fragments = []
-        self._last_raw_length = 0
-
-    def _invalidate_cache_if_needed(self, current_length: int):
-        """Invalidates fragment cache if buffer is shortened."""
-        if current_length < self._last_raw_length:
-            self._parsed_fragments = []
-            self._last_raw_length = 0
-
-    def _process_new_text_to_fragments(self, new_raw_text: str):
-        """Converts new raw text into a list of formatted fragments."""
-        new_fragments = []
-        lines = new_raw_text.split("\n")
-
-        for i, line in enumerate(lines):
-            # Process each line for ANSI codes
-            if line:
-                line_fragments = to_formatted_text(ANSI(line))
-                new_fragments.extend(line_fragments)
-
-            # Add explicit newline fragment after every line except the last
-            if i < len(lines) - 1:
-                new_fragments.append(("", "\n"))
-        return new_fragments
-
-    def _update_fragments_from_new_text(self, new_raw_text: str):
-        """Processes new text and updates the internal fragment cache."""
-        new_fragments = self._process_new_text_to_fragments(new_raw_text)
-        self._parsed_fragments.extend(new_fragments)
 
     def apply_transformation(
         self, transformation_input: TransformationInput
     ) -> Transformation:
         """
-        Parses only the new text appended to the buffer since the last run,
-        ensuring newlines are correctly preserved as line breaks.
+        Parses the entire buffer text, converting ANSI codes to formatted text
+        and ensuring newlines are correctly preserved as line breaks.
         """
         full_text = transformation_input.document.text
-        current_length = len(full_text)
+        fragments = []
 
-        self._invalidate_cache_if_needed(current_length)
+        # Don't use `splitlines` as it swallows the final newline if present
+        lines = full_text.split("\n")
 
-        new_raw_text = full_text[self._last_raw_length :]
-        if new_raw_text:
-            self._update_fragments_from_new_text(new_raw_text)
-            self._last_raw_length = current_length
+        for i, line in enumerate(lines):
+            if line:
+                line_fragments = to_formatted_text(ANSI(line))
+                fragments.extend(line_fragments)
 
-        return Transformation(self._parsed_fragments)
+            if i < len(lines) - 1:
+                fragments.append(("", "\n"))
+
+        return Transformation(fragments)
 
 
 def _get_char_style(char):
@@ -165,6 +139,16 @@ def _get_pty_screen_fragments(pyte_screen):
         fragments.extend(line_fragments)
         fragments.append(("", "\n"))
     return fragments
+
+
+def _sanitize_control_characters(text: str) -> str:
+    """Removes all ASCII control characters except for Tab and Line Feed."""
+    sanitized_chars = []
+    for char in text:
+        # Keep printable ASCII, Tab, and Line Feed
+        if char >= " " or char in ("\t", "\n"):
+            sanitized_chars.append(char)
+    return "".join(sanitized_chars)
 
 
 def _append_to_log(log_buffer: Buffer, text_to_append: str):
@@ -295,7 +279,7 @@ def _create_console_layout(log_buffer, get_pty_screen_fragments, current_mode):
         Window(content=pty_control, dont_extend_height=True), filter=is_serial_mode
     )
 
-    log_control = BufferControl(buffer=log_buffer, input_processors=[AnsiColorProcessor()])
+    log_control = BufferControl(buffer=log_buffer)
     monitor_container = ConditionalContainer(
         Window(content=log_control, wrap_lines=True), filter=~is_serial_mode
     )
@@ -348,7 +332,9 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue):
 async def _process_monitor_data(data, log_queue):
     """Decodes monitor data and puts it in the log queue."""
     text = data.decode("utf-8", errors="replace")
-    await log_queue.put(text)
+    normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
+    sanitized_text = _sanitize_control_characters(normalized_text)
+    await log_queue.put(sanitized_text)
 
 
 async def _read_from_monitor(monitor_sock, log_queue):
