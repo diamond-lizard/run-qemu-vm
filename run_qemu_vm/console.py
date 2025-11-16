@@ -311,7 +311,7 @@ async def _log_task_error(log_queue: Queue, task_name: str, error_type: str = "E
 
 def _process_pty_data(data, app, pyte_stream):
     """Feeds PTY data to the stream and invalidates the app."""
-    pyte_stream.feed(data)
+    pyte_stream.feed(data.decode("utf-8", "replace"))
     app.invalidate()
 
 
@@ -347,7 +347,7 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue):
 
 def _process_monitor_data(data, app, monitor_pyte_stream):
     """Feeds monitor data to the stream and invalidates the app."""
-    monitor_pyte_stream.feed(data)
+    monitor_pyte_stream.feed(data.decode("utf-8", "replace"))
     app.invalidate()
 
 
@@ -417,9 +417,9 @@ def _initialize_console_state():
         app_config.MODE_SERIAL_CONSOLE
     ]  # List to be mutable from closures
     pyte_screen = pyte.Screen(80, 24)
-    pyte_stream = pyte.ByteStream(pyte_screen)
+    pyte_stream = pyte.Stream(pyte_screen)
     monitor_pyte_screen = pyte.Screen(80, 24)
-    monitor_pyte_stream = pyte.ByteStream(monitor_pyte_screen)
+    monitor_pyte_stream = pyte.Stream(monitor_pyte_screen)
     return log_queue, log_buffer, current_mode, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream
 
 
@@ -460,11 +460,6 @@ async def _run_application_loop(app, pty_device, current_mode, pty_fd):
         f"\nConnected to serial console: {pty_device}\nPress Ctrl-] for control menu.\n",
         flush=True,
     )
-    # HACK: Send Ctrl-L after a delay to force a redraw in some guest OSes
-    await asyncio.sleep(1.5)
-    if current_mode[0] == app_config.MODE_SERIAL_CONSOLE:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, os.write, pty_fd, b"\x0c")
 
     result = await app.run_async() or ""
     print(f"Exiting console session: {result}")
