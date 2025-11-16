@@ -2,4 +2,6 @@
 name = "run-qemu-vm"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "prompt-toolkit>=3.0.52",
+]
