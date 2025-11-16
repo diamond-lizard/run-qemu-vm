@@ -305,28 +305,36 @@ def _get_direct_boot_kernel_cmdline(config):
     return "console=ttyS0,115200n8 panic=1"
 
 
+def _extract_single_file_from_iso(seven_zip_executable, iso_path, file_in_iso, temp_dir):
+    """Extracts a single file from an ISO into a temporary directory."""
+    base_name = os.path.basename(file_in_iso)
+    output_path = os.path.join(temp_dir, base_name)
+    extract_path = file_in_iso.lstrip('/')
+
+    if os.environ.get("DEBUG"):
+        print(f"Debug: Extracting '{extract_path}' from ISO to '{output_path}'")
+
+    result = subprocess.run(
+        [seven_zip_executable, "e", iso_path, f"-o{temp_dir}", extract_path],
+        capture_output=True, text=True, check=False
+    )
+
+    if result.returncode != 0 or not os.path.exists(output_path):
+        print(f"Error: Failed to extract '{extract_path}' from ISO.", file=sys.stderr)
+        if os.environ.get("DEBUG"):
+            print(f"Debug: 7z output: {result.stdout}\nDebug: 7z errors: {result.stderr}", file=sys.stderr)
+        raise RuntimeError(f"Failed to extract {extract_path}")
+
+    print(f"Info: Extracted {base_name} to: {output_path}")
+    return output_path
+
+
 def _extract_iso_files(seven_zip_executable, iso_path, files_to_extract, temp_dir):
     """Extracts specified files from an ISO into a temporary directory."""
     for file_in_iso in files_to_extract:
-        base_name = os.path.basename(file_in_iso)
-        output_path = os.path.join(temp_dir, base_name)
-        extract_path = file_in_iso.lstrip('/')
-
-        if os.environ.get("DEBUG"):
-            print(f"Debug: Extracting '{extract_path}' from ISO to '{output_path}'")
-
-        result = subprocess.run(
-            [seven_zip_executable, "e", iso_path, f"-o{temp_dir}", extract_path],
-            capture_output=True, text=True, check=False
+        output_path = _extract_single_file_from_iso(
+            seven_zip_executable, iso_path, file_in_iso, temp_dir
         )
-
-        if result.returncode != 0 or not os.path.exists(output_path):
-            print(f"Error: Failed to extract '{extract_path}' from ISO.", file=sys.stderr)
-            if os.environ.get("DEBUG"):
-                print(f"Debug: 7z output: {result.stdout}\nDebug: 7z errors: {result.stderr}", file=sys.stderr)
-            raise RuntimeError(f"Failed to extract {extract_path}")
-
-        print(f"Info: Extracted {base_name} to: {output_path}")
         yield file_in_iso, output_path
 
 
