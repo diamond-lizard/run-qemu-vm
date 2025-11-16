@@ -275,6 +275,18 @@ def _create_uefi_startup_script(temp_dir, bootloader_script_path):
     print(f"Info: Created temporary startup.nsh in '{temp_dir}'")
 
 
+def _handle_uefi_bootloader_not_found(tools_tried, patterns):
+    """Handles the case where no UEFI bootloader could be found, exiting or warning as appropriate."""
+    is_macos = platform.system() == 'Darwin'
+    if not is_macos:
+        print(f"Error: Could not find UEFI bootloader. Tried: {', '.join(tools_tried)}", file=sys.stderr)
+        print("       Install either genisoimage/isoinfo or p7zip-full/7z.", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(f"Warning: Could not find a suitable bootloader ({', '.join(patterns)}) in the ISO. Tried: {', '.join(tools_tried)}", file=sys.stderr)
+        return None, None
+
+
 def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
     """Inspects an ISO to find the UEFI bootloader file for the given architecture."""
     patterns = _get_uefi_bootloader_patterns(architecture)
@@ -299,13 +311,12 @@ def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
     tools_tried.append(reason)
 
     # If we get here, no tool worked
-    if not is_macos:
-        print(f"Error: Could not find UEFI bootloader. Tried: {', '.join(tools_tried)}", file=sys.stderr)
-        print("       Install either genisoimage/isoinfo or p7zip-full/7z.", file=sys.stderr)
-        sys.exit(1)
-    else:
-        print(f"Warning: Could not find a suitable bootloader ({', '.join(patterns)}) in the ISO. Tried: {', '.join(tools_tried)}", file=sys.stderr)
-        return None, None
+    return _handle_uefi_bootloader_not_found(tools_tried, patterns)
+
+
+def _warn_kernel_initrd_not_found(tools_tried):
+    """Prints a warning that kernel/initrd could not be found."""
+    return _warn_kernel_initrd_not_found(tools_tried)
 
 
 def find_kernel_and_initrd(seven_zip_executable, iso_path):
@@ -339,62 +350,79 @@ def find_kernel_and_initrd(seven_zip_executable, iso_path):
     return None, None
 
 
+def _remove_cdrom_args(args):
+    """Removes -cdrom and its path from the argument list."""
+    args_copy = list(args)
+    if "-cdrom" in args_copy:
+        cdrom_index = args_copy.index("-cdrom")
+        args_copy.pop(cdrom_index)  # Remove '-cdrom'
+        args_copy.pop(cdrom_index)  # Remove path
+    return args_copy
+
+
+def _run_direct_boot_linux(args, config, kernel_file, initrd_file, kernel_cmd_line):
+    """Handles direct kernel boot on Linux by extracting files from the ISO."""
+    with tempfile.TemporaryDirectory(prefix="qemu-kernel-") as temp_dir:
+        try:
+            extracted_files = dict(_extract_iso_files(
+                config["seven_zip_executable"], config["cdrom"],
+                [kernel_file, initrd_file], temp_dir
+            ))
+            kernel_path = extracted_files[kernel_file]
+            initrd_path = extracted_files[initrd_file]
+        except (RuntimeError, Exception) as e:
+            print(f"Error: Failed during file extraction from ISO: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        args.extend(["-kernel", kernel_path, "-initrd", initrd_path])
+        args.extend(["-append", kernel_cmd_line, "-nographic"])
+        _run_direct_kernel_boot(args, config, kernel_cmd_line)
+
+
+def _run_direct_boot_iso_syntax(args, config, kernel_file, initrd_file, kernel_cmd_line):
+    """Handles direct kernel boot on non-Linux systems using QEMU's 'iso:' syntax."""
+    iso_kernel_path = kernel_file.lstrip('/')
+    iso_initrd_path = initrd_file.lstrip('/')
+    args.extend([
+        "-kernel", f"iso:{config['cdrom']}:{iso_kernel_path}",
+        "-initrd", f"iso:{config['cdrom']}:{iso_initrd_path}",
+        "-append", kernel_cmd_line,
+        "-nographic"
+    ])
+    _run_direct_kernel_boot(args, config, kernel_cmd_line)
+
+
 def add_direct_kernel_boot_args(base_args, config, kernel_file, initrd_file):
     """
     Constructs QEMU arguments for direct kernel boot and executes QEMU.
     This function is a terminal operation; it will exit the script.
     """
-    args = list(base_args)
-
-    # Remove the -cdrom flag and its path, as we are replacing it.
-    if "-cdrom" in args:
-        cdrom_index = args.index("-cdrom")
-        args.pop(cdrom_index)  # Remove '-cdrom'
-        args.pop(cdrom_index)  # Remove path
-
+    args = _remove_cdrom_args(base_args)
     kernel_cmd_line = _get_direct_boot_kernel_cmdline(config)
 
     if platform.system() == 'Linux':
-        with tempfile.TemporaryDirectory(prefix="qemu-kernel-") as temp_dir:
-            try:
-                extracted_files = dict(_extract_iso_files(
-                    config["seven_zip_executable"], config["cdrom"],
-                    [kernel_file, initrd_file], temp_dir
-                ))
-                kernel_path = extracted_files[kernel_file]
-                initrd_path = extracted_files[initrd_file]
-            except (RuntimeError, Exception) as e:
-                print(f"Error: Failed during file extraction from ISO: {e}", file=sys.stderr)
-                sys.exit(1)
-
-            args.extend(["-kernel", kernel_path, "-initrd", initrd_path])
-            args.extend(["-append", kernel_cmd_line, "-nographic"])
-            _run_direct_kernel_boot(args, config, kernel_cmd_line)
+        _run_direct_boot_linux(args, config, kernel_file, initrd_file, kernel_cmd_line)
     else:
-        # macOS/other behavior: use QEMU's 'iso:' syntax
-        iso_kernel_path = kernel_file.lstrip('/')
-        iso_initrd_path = initrd_file.lstrip('/')
-        args.extend([
-            "-kernel", f"iso:{config['cdrom']}:{iso_kernel_path}",
-            "-initrd", f"iso:{config['cdrom']}:{iso_initrd_path}",
-            "-append", kernel_cmd_line,
-            "-nographic"
+        _run_direct_boot_iso_syntax(args, config, kernel_file, initrd_file, kernel_cmd_line)
+
+
+def _run_uefi_with_automation(base_args, config, bootloader_script_path):
+    """Runs QEMU with a temporary startup.nsh to automate UEFI boot."""
+    with tempfile.TemporaryDirectory(prefix="qemu-uefi-boot-") as temp_dir:
+        _create_uefi_startup_script(temp_dir, bootloader_script_path)
+        automated_args = list(base_args)
+        automated_args.extend([
+            "-drive", f"if=none,id=boot-script,format=raw,file=fat:rw:{temp_dir}",
+            "-device", "usb-storage,drive=boot-script"
         ])
-        _run_direct_kernel_boot(args, config, kernel_cmd_line)
+        process.run_qemu(automated_args, config)
 
 
 def create_and_run_uefi_with_automation(base_args, config):
     """Creates a temporary startup.nsh to automate UEFI boot and runs QEMU."""
     bootloader_name, bootloader_script_path = find_uefi_bootloader(config['seven_zip_executable'], config['cdrom'], config['architecture'])
     if bootloader_name and bootloader_script_path:
-        with tempfile.TemporaryDirectory(prefix="qemu-uefi-boot-") as temp_dir:
-            _create_uefi_startup_script(temp_dir, bootloader_script_path)
-            automated_args = list(base_args)
-            automated_args.extend([
-                "-drive", f"if=none,id=boot-script,format=raw,file=fat:rw:{temp_dir}",
-                "-device", "usb-storage,drive=boot-script"
-            ])
-            process.run_qemu(automated_args, config)
+        _run_uefi_with_automation(base_args, config, bootloader_script_path)
     else:
         print("Warning: Proceeding without boot automation script.", file=sys.stderr)
         process.run_qemu(base_args, config)
