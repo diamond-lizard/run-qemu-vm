@@ -114,26 +114,43 @@ def _get_char_style(char):
     return " ".join(style_parts)
 
 
+def _coalesce_char_into_fragment(char, current_text, current_style, line_fragments):
+    """
+    Coalesces a character into a text run if its style matches.
+
+    If the style differs, the current text run is added to the fragments list
+    and a new run is started with the given character.
+
+    Returns the updated text run and style.
+    """
+    style_str = _get_char_style(char)
+    # The `pyte.Char` object is `char['data']`. Its `data` attribute holds the character.
+    char_data = char["data"].data
+
+    if style_str == current_style:
+        current_text += char_data
+    else:
+        if current_text:
+            line_fragments.append((current_style, current_text))
+        current_text = char_data
+        current_style = style_str
+
+    return current_text, current_style
+
+
 def _process_line_to_fragments(y, pyte_screen):
     """Processes a single line from the pyte screen into fragments."""
     line_fragments = []
     current_text = ""
     current_style = ""  # Start with an empty style string
+
     for x in range(pyte_screen.columns):
         char = pyte_screen.buffer[y, x]
-        style_str = _get_char_style(char)
+        current_text, current_style = _coalesce_char_into_fragment(
+            char, current_text, current_style, line_fragments
+        )
 
-        # The `pyte.Char` object is `char['data']`. Its `data` attribute holds the character.
-        char_data = char["data"].data
-
-        if style_str == current_style:
-            current_text += char_data
-        else:
-            if current_text:
-                line_fragments.append((current_style, current_text))
-            current_style = style_str
-            current_text = char_data
-
+    # After the loop, add any remaining text as the final fragment
     if current_text:
         line_fragments.append((current_style, current_text))
 
