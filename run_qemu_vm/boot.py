@@ -92,56 +92,88 @@ def _get_kernel_initrd_patterns():
     return kernel_patterns, initrd_patterns
 
 
+def _get_isoinfo_blocks(listing_output):
+    """Splits the isoinfo listing into directory blocks."""
+    return [block.strip() for block in listing_output.split("\n\n") if block.strip()]
+
+
+def _parse_directory_from_block_header(block_lines):
+    """Parses the directory path from the header of an isoinfo block."""
+    dir_header = next((line for line in block_lines if line.startswith("Directory listing of")), None)
+    if not dir_header:
+        return None
+    try:
+        # e.g., "Directory listing of /isolinux':"
+        return dir_header.split()[-1].strip("'").strip(":")
+    except IndexError:
+        if os.environ.get("DEBUG"):
+            print(f"Debug: Could not parse directory from header: {dir_header}")
+        return None
+
+
+def _parse_file_info_from_line(line):
+    """
+    Parses a file line from isoinfo output, returning filename and size.
+    Returns (None, None) if the line is not a valid file entry.
+    """
+    if not line.startswith('-r-'):
+        return None, None
+    parts = line.split()
+    if len(parts) < 10:
+        return None, None
+    try:
+        filename = parts[-1]
+        if filename in ('.', '..'):
+            return None, None
+        file_size = int(parts[4])
+        return filename, file_size
+    except (ValueError, IndexError) as e:
+        if os.environ.get("DEBUG"):
+            print(f"Debug: Skipping malformed ISO line: {line} ({e})")
+        return None, None
+
+
+def _find_candidates_in_block(block, kernel_patterns, initrd_patterns):
+    """Yields kernel and initrd candidates found in a single isoinfo block."""
+    lines = block.splitlines()
+    current_directory = _parse_directory_from_block_header(lines)
+    if not current_directory:
+        return
+
+    for line in lines:
+        filename, file_size = _parse_file_info_from_line(line)
+        if not filename or not file_size or file_size < 100_000:
+            continue
+
+        full_path = os.path.join('/', current_directory, filename).replace('\\', '/').replace('//', '/')
+        lower_path = full_path.lower()
+
+        for pattern in kernel_patterns:
+            if re.search(pattern, lower_path):
+                if os.environ.get("DEBUG"):
+                    print(f"Debug: Kernel candidate: {full_path} (size:{file_size})")
+                yield 'kernel', (full_path, file_size)
+                break
+
+        for pattern in initrd_patterns:
+            if re.search(pattern, lower_path):
+                if os.environ.get("DEBUG"):
+                    print(f"Debug: Initrd candidate: {full_path} (size:{file_size})")
+                yield 'initrd', (full_path, file_size)
+                break
+
+
 def _parse_isoinfo_listing(listing_output, kernel_patterns, initrd_patterns):
     """Parses the output of 'isoinfo -l' to find kernel/initrd candidates."""
     candidate_kernels = []
     candidate_initrds = []
-    current_directory = None
 
-    for block in listing_output.split("\n\n"):
-        lines = [line.strip() for line in block.splitlines()]
-        if not lines:
-            continue
-
-        dir_header = next((line for line in lines if line.startswith("Directory listing of")), None)
-        if dir_header:
-            current_directory = dir_header.split()[-1].strip("'").strip(":")
-        if not current_directory:
-            continue
-
-        for line in lines:
-            if not line.startswith('-r-'):
-                continue
-            parts = line.split()
-            if len(parts) < 10:
-                continue
-            try:
-                filename = parts[-1]
-                if filename in ('.', '..'):
-                    continue
-
-                full_path = os.path.join('/', current_directory, filename).replace('\\', '/').replace('//', '/')
-                lower_path = full_path.lower()
-                file_size = int(parts[4])
-                if file_size < 100_000:  # Heuristic to skip small files
-                    continue
-
-                for pattern in kernel_patterns:
-                    if re.search(pattern, lower_path):
-                        candidate_kernels.append((full_path, file_size))
-                        if os.environ.get("DEBUG"):
-                            print(f"Debug: Kernel candidate: {full_path} (size:{file_size})")
-                        break
-
-                for pattern in initrd_patterns:
-                    if re.search(pattern, lower_path):
-                        candidate_initrds.append((full_path, file_size))
-                        if os.environ.get("DEBUG"):
-                            print(f"Debug: Initrd candidate: {full_path} (size:{file_size})")
-                        break
-            except (ValueError, IndexError) as e:
-                if os.environ.get("DEBUG"):
-                    print(f"Debug: Skipping malformed ISO line: {line} ({e})")
+    for block in _get_isoinfo_blocks(listing_output):
+        for candidate_type, candidate_data in _find_candidates_in_block(block, kernel_patterns, initrd_patterns):
+            if candidate_type == 'kernel':
+                candidate_kernels.append(candidate_data)
+            elif candidate_type == 'initrd':
+                candidate_initrds.append(candidate_data)
 
     return candidate_kernels, candidate_initrds
 
