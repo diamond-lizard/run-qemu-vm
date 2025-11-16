@@ -17,6 +17,7 @@ def parse_share_dir_argument(share_dir_arg):
         print("Error: --share-dir format must be '/host/path:mount_tag'", file=sys.stderr)
         sys.exit(1)
     host_path, mount_tag = share_dir_arg.rsplit(':', 1)
+    host_path = os.path.expanduser(host_path)
     if not os.path.isdir(host_path):
         print(f"Error: Host path is not a directory: {host_path}", file=sys.stderr)
         sys.exit(1)
@@ -151,6 +152,12 @@ def main():
 
     args = parser.parse_args()
     config = vars(args)
+
+    # Expand user home directory in path arguments
+    if config.get("disk_image"):
+        config["disk_image"] = os.path.expanduser(config["disk_image"])
+    if config.get("cdrom"):
+        config["cdrom"] = os.path.expanduser(config["cdrom"])
 
     if args.architecture == 'list':
         print("Available QEMU architectures:\n" + "\n".join(f"  - {arch}" for arch in app_config.SUPPORTED_ARCHITECTURES))
