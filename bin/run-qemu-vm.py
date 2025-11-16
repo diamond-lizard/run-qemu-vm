@@ -47,6 +47,11 @@ import socket
 import threading
 import platform
 import traceback
+
+# Ensure the package is in the path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from run_qemu_vm import config as app_config
+
 import asyncio
 from asyncio import Queue
 from collections import deque
@@ -63,92 +68,6 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.shortcuts import button_dialog
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 import pyte
-
-# --- Global Configuration & Executable Paths ---
-
-# List of supported QEMU architectures
-SUPPORTED_ARCHITECTURES = [
-    "aarch64", "alpha", "arm", "avr", "hppa", "i386", "loongarch64", "m68k",
-    "microblaze", "microblazeel", "mips", "mips64", "mips64el", "mipsel",
-    "or1k", "ppc", "ppc64", "riscv32", "riscv64", "rx", "s390x", "sh4",
-    "sh4eb", "sparc", "sparc64", "tricore", "x86_64", "xtensa", "xtensaeb"
-]
-
-# The command for the Homebrew package manager, used to auto-locate QEMU files.
-BREW_EXECUTABLE = "brew"
-# The specific QEMU binary for emulating a system. This will be set based on --architecture.
-QEMU_EXECUTABLE = None
-# The command for the 7-Zip archive tool, used to extract kernel/initrd from ISOs.
-SEVEN_ZIP_EXECUTABLE = "7z"
-# The virtual machine type QEMU will emulate; 'virt' is a modern standard for many architectures.
-MACHINE_TYPE = "virt"
-# The hardware virtualization framework to use; will be auto-detected.
-ACCELERATOR = None
-# The CPU model to emulate; 'host' passes through the host CPU features for best performance.
-CPU_MODEL = "host"
-# The default amount of RAM to allocate to the virtual machine.
-MEMORY = "4G"
-# The default number of virtual CPU cores for the guest system.
-SMP_CORES = 4
-# The path to the UEFI firmware code file; auto-detected if not specified.
-UEFI_CODE_PATH = None
-# The path to the UEFI variables file, for persistent settings; auto-generated if not specified.
-UEFI_VARS_PATH = None
-# The virtual graphics device to use in GUI mode; auto-selected if not specified.
-GRAPHICS_DEVICE = None
-# The QEMU display configuration string for GUI mode.
-DISPLAY_TYPE = "default,show-cursor=on"
-# The virtual USB controller model.
-USB_CONTROLLER = "qemu-xhci"
-# The virtual keyboard device to attach in GUI mode.
-KEYBOARD_DEVICE = "usb-kbd"
-# The virtual mouse/tablet device to attach in GUI mode for accurate cursor tracking.
-MOUSE_DEVICE = "usb-tablet"
-
-# --- Serial Console Configuration ---
-SERIAL_DEVICE_PROFILES = {
-    "pc": {
-        "args": ["-device", "isa-serial,chardev=char0"],
-        "description": "Standard PC serial port (ISA/16550A). Expected by most x86 OSes."
-    },
-    "pl011": {
-        "args": ["-serial", "chardev:char0"],
-        "description": "ARM PL011 serial port. Standard for ARM 'virt' machines."
-    },
-    "virtio": {
-        "args": ["-device", "virtio-serial-pci", "-device", "virtconsole,chardev=char0"],
-        "description": "Virtio paravirtualized serial port. High-performance, requires guest drivers."
-    }
-}
-
-ARCH_DEFAULT_SERIAL = {
-    "x86_64": "virtio",
-    "i386": "virtio",
-    "aarch64": "virtio",
-    "riscv64": "virtio",
-    "default": "pl011" # Fallback for other arches
-}
-
-
-# --- Network Configuration ---
-
-# The network backend mode for QEMU user-mode networking (SLIRP/NAT).
-NETWORK_MODE = "user"
-NETWORK_ID = "net0"
-NETWORK_PORT_FORWARDS = "hostfwd=tcp::2222-:22,hostfwd=tcp::6001-:6001"
-NETWORK_BACKEND = f"{NETWORK_MODE},id={NETWORK_ID}" + (f",{NETWORK_PORT_FORWARDS}" if NETWORK_PORT_FORWARDS else "")
-NETWORK_DEVICE = f"virtio-net-pci,netdev={NETWORK_ID}"
-
-# --- Directory Sharing Configuration ---
-VIRTFS_SECURITY_MODEL = "mapped-xattr"
-VIRTFS_VERSION = "9p2000.L"
-MOUNT_TAG_PATTERN = r'^[a-zA-Z0-9_]+$'
-MOUNT_TAG_ALLOWED_CHARS = "letters (a-z, A-Z), numbers (0-9), and underscores (_)"
-
-# --- Text Console Mode Constants ---
-MODE_SERIAL_CONSOLE = 'serial_console'
-MODE_CONTROL_MENU = 'control_menu'
-MODE_QEMU_MONITOR = 'qemu_monitor'
 
 def get_qemu_prefix(brew_executable):
     """Finds the Homebrew installation prefix for QEMU."""
@@ -395,7 +314,7 @@ def add_direct_kernel_boot_args(base_args, config, kernel_file, initrd_file):
         args.pop(cdrom_index)
 
     # 2. Add the direct boot arguments
-    serial_profile_key = config.get("serial_device") or ARCH_DEFAULT_SERIAL.get(config['architecture'], ARCH_DEFAULT_SERIAL['default'])
+    serial_profile_key = config.get("serial_device") or app_config.ARCH_DEFAULT_SERIAL.get(config['architecture'], app_config.ARCH_DEFAULT_SERIAL['default'])
     if serial_profile_key == 'virtio':
         kernel_cmd_line = "console=hvc0 panic=1"
     else:
@@ -465,7 +384,7 @@ def add_direct_kernel_boot_args(base_args, config, kernel_file, initrd_file):
             config['monitor_socket'] = monitor_socket
             args.extend(["-monitor", f"unix:{monitor_socket},server,nowait", "-chardev", "pty,id=char0"])
 
-            serial_args = SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
+            serial_args = app_config.SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
             print(f"Info: Using '{serial_profile_key}' serial profile for Direct Kernel Boot.")
             args.extend(serial_args)
 
@@ -488,7 +407,7 @@ def add_direct_kernel_boot_args(base_args, config, kernel_file, initrd_file):
         config['monitor_socket'] = monitor_socket
         args.extend(["-monitor", f"unix:{monitor_socket},server,nowait", "-chardev", "pty,id=char0"])
 
-        serial_args = SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
+        serial_args = app_config.SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
         print(f"Info: Using '{serial_profile_key}' serial profile for Direct Kernel Boot.")
         args.extend(serial_args)
 
@@ -507,8 +426,8 @@ def parse_share_dir_argument(share_dir_arg):
     if not os.path.isdir(host_path):
         print(f"Error: Host path is not a directory: {host_path}", file=sys.stderr)
         sys.exit(1)
-    if not re.match(MOUNT_TAG_PATTERN, mount_tag):
-        print(f"Error: Invalid characters in mount tag '{mount_tag}'. Allowed: {MOUNT_TAG_ALLOWED_CHARS}", file=sys.stderr)
+    if not re.match(app_config.MOUNT_TAG_PATTERN, mount_tag):
+        print(f"Error: Invalid characters in mount tag '{mount_tag}'. Allowed: {app_config.MOUNT_TAG_ALLOWED_CHARS}", file=sys.stderr)
         sys.exit(1)
     return os.path.abspath(host_path), mount_tag
 
@@ -579,7 +498,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
     """Manages a prompt_toolkit-based text console session for QEMU."""
     log_queue = Queue()
     log_buffer = Buffer(read_only=True)
-    current_mode = [MODE_SERIAL_CONSOLE]  # Use a list to allow modification from closures
+    current_mode = [app_config.MODE_SERIAL_CONSOLE]  # Use a list to allow modification from closures
 
     # --- Pyte Terminal Emulation State ---
     pyte_screen = pyte.Screen(80, 24)
@@ -681,25 +600,25 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
                     pass # Socket might be closed
             app.exit(result="User quit")
         elif result == 'monitor':
-            current_mode[0] = MODE_QEMU_MONITOR
+            current_mode[0] = app_config.MODE_QEMU_MONITOR
             await log_queue.put("\n--- Switched to QEMU Monitor (Ctrl-] for menu) ---\n")
             app.invalidate()
         else:  # resume
-            current_mode[0] = MODE_SERIAL_CONSOLE
+            current_mode[0] = app_config.MODE_SERIAL_CONSOLE
             app.invalidate()
 
     @key_bindings.add('<any>')
     async def _(event):
         loop = asyncio.get_running_loop()
         try:
-            if current_mode[0] == MODE_SERIAL_CONSOLE:
+            if current_mode[0] == app_config.MODE_SERIAL_CONSOLE:
                 await loop.run_in_executor(None, os.write, pty_fd, event.data.encode('utf-8', errors='replace'))
-            elif current_mode[0] == MODE_QEMU_MONITOR and monitor_sock:
+            elif current_mode[0] == app_config.MODE_QEMU_MONITOR and monitor_sock:
                 await loop.sock_sendall(monitor_sock, event.data.encode('utf-8', errors='replace'))
         except OSError:
             pass # Ignore write errors if PTY/socket is closed
 
-    is_serial_mode = Condition(lambda: current_mode[0] == MODE_SERIAL_CONSOLE)
+    is_serial_mode = Condition(lambda: current_mode[0] == app_config.MODE_SERIAL_CONSOLE)
 
     pty_control = FormattedTextControl(text=get_pty_screen_fragments)
     pty_container = ConditionalContainer(Window(content=pty_control, dont_extend_height=True), filter=is_serial_mode)
@@ -770,7 +689,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         print(f"\nConnected to serial console: {pty_device}\nPress Ctrl-] for control menu.\n", flush=True)
         # HACK: Send Ctrl-L after a delay to force a redraw in some guest OSes
         await asyncio.sleep(1.5)
-        if current_mode[0] == MODE_SERIAL_CONSOLE:
+        if current_mode[0] == app_config.MODE_SERIAL_CONSOLE:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, os.write, pty_fd, b'\x0c')
 
@@ -827,7 +746,7 @@ def build_qemu_args(config):
     if config.get("share_dir"):
         host_path, mount_tag = parse_share_dir_argument(config["share_dir"])
         if host_path and mount_tag:
-            args.extend(["-virtfs", f"local,path={host_path},mount_tag={mount_tag},security_model={VIRTFS_SECURITY_MODEL},id={mount_tag}"])
+            args.extend(["-virtfs", f"local,path={host_path},mount_tag={mount_tag},security_model={app_config.VIRTFS_SECURITY_MODEL},id={mount_tag}"])
         else:
             sys.exit(1)
 
@@ -880,8 +799,8 @@ def build_qemu_args(config):
         config['monitor_socket'] = monitor_socket
         args.extend(["-monitor", f"unix:{monitor_socket},server,nowait", "-chardev", "pty,id=char0"])
 
-        serial_profile_key = config.get("serial_device") or ARCH_DEFAULT_SERIAL.get(config['architecture'], ARCH_DEFAULT_SERIAL['default'])
-        serial_args = SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
+        serial_profile_key = config.get("serial_device") or app_config.ARCH_DEFAULT_SERIAL.get(config['architecture'], app_config.ARCH_DEFAULT_SERIAL['default'])
+        serial_args = app_config.SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
         print(f"Info: Using '{serial_profile_key}' serial profile.")
         args.extend(serial_args)
         args.append("-nographic")
@@ -978,18 +897,18 @@ def main():
     parser.add_argument("--share-dir", metavar="/HOST/PATH:MOUNT_TAG", help="Share a host directory with the guest via VirtFS.")
     parser.add_argument("--serial-device", help="Serial device profile for text mode. Use 'list' to see options.")
 
-    parser.add_argument("--machine-type", default=MACHINE_TYPE, help="QEMU machine type.")
-    parser.add_argument("--accelerator", default=ACCELERATOR, help="VM accelerator (e.g., hvf, kvm, tcg). Default: auto-detected.")
-    parser.add_argument("--cpu-model", default=CPU_MODEL, help="CPU model to emulate.")
-    parser.add_argument("--memory", default=MEMORY, help="RAM for the VM.")
-    parser.add_argument("--smp-cores", type=int, default=SMP_CORES, help="Number of CPU cores.")
+    parser.add_argument("--machine-type", default=app_config.MACHINE_TYPE, help="QEMU machine type.")
+    parser.add_argument("--accelerator", default=app_config.ACCELERATOR, help="VM accelerator (e.g., hvf, kvm, tcg). Default: auto-detected.")
+    parser.add_argument("--cpu-model", default=app_config.CPU_MODEL, help="CPU model to emulate.")
+    parser.add_argument("--memory", default=app_config.MEMORY, help="RAM for the VM.")
+    parser.add_argument("--smp-cores", type=int, default=app_config.SMP_CORES, help="Number of CPU cores.")
     parser.add_argument("--vga-type", default=None, help="QEMU VGA card type (e.g., std, virtio, qxl). Overrides automatic selection.")
 
     suppressed_args = {
-        "qemu_executable": QEMU_EXECUTABLE, "seven_zip_executable": SEVEN_ZIP_EXECUTABLE, "brew_executable": BREW_EXECUTABLE,
-        "uefi_code_path": UEFI_CODE_PATH, "uefi_vars_path": UEFI_VARS_PATH,
-        "display_type": DISPLAY_TYPE, "usb_controller": USB_CONTROLLER, "keyboard_device": KEYBOARD_DEVICE,
-        "mouse_device": MOUSE_DEVICE, "network_backend": NETWORK_BACKEND, "network_device": NETWORK_DEVICE
+        "qemu_executable": app_config.QEMU_EXECUTABLE, "seven_zip_executable": app_config.SEVEN_ZIP_EXECUTABLE, "brew_executable": app_config.BREW_EXECUTABLE,
+        "uefi_code_path": app_config.UEFI_CODE_PATH, "uefi_vars_path": app_config.UEFI_VARS_PATH,
+        "display_type": app_config.DISPLAY_TYPE, "usb_controller": app_config.USB_CONTROLLER, "keyboard_device": app_config.KEYBOARD_DEVICE,
+        "mouse_device": app_config.MOUSE_DEVICE, "network_backend": app_config.NETWORK_BACKEND, "network_device": app_config.NETWORK_DEVICE
     }
     for arg, default_val in suppressed_args.items():
         cli_arg = f"--{arg.replace('_', '-')}"
@@ -999,22 +918,22 @@ def main():
     config = vars(args)
 
     if args.architecture == 'list':
-        print("Available QEMU architectures:\n" + "\n".join(f"  - {arch}" for arch in SUPPORTED_ARCHITECTURES))
+        print("Available QEMU architectures:\n" + "\n".join(f"  - {arch}" for arch in app_config.SUPPORTED_ARCHITECTURES))
         sys.exit(0)
-    if args.architecture not in SUPPORTED_ARCHITECTURES:
+    if args.architecture not in app_config.SUPPORTED_ARCHITECTURES:
         print(f"Error: Unsupported architecture '{args.architecture}'. Use 'list' for options.", file=sys.stderr)
         sys.exit(1)
     if not args.disk_image:
         parser.error("--disk-image is required.")
 
     if args.serial_device == 'list':
-        default_key = ARCH_DEFAULT_SERIAL.get(args.architecture, ARCH_DEFAULT_SERIAL['default'])
+        default_key = app_config.ARCH_DEFAULT_SERIAL.get(args.architecture, app_config.ARCH_DEFAULT_SERIAL['default'])
         print(f"Available serial device profiles for architecture '{args.architecture}':")
-        for key, profile in SERIAL_DEVICE_PROFILES.items():
+        for key, profile in app_config.SERIAL_DEVICE_PROFILES.items():
             is_default = "(default)" if key == default_key else ""
             print(f"  - {key:<10} {is_default:<10} {profile['description']}")
         sys.exit(0)
-    if args.serial_device and args.serial_device not in SERIAL_DEVICE_PROFILES:
+    if args.serial_device and args.serial_device not in app_config.SERIAL_DEVICE_PROFILES:
         print(f"Error: Unknown serial device profile '{args.serial_device}'. Use 'list' for options.", file=sys.stderr)
         sys.exit(1)
 
