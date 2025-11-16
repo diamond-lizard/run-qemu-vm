@@ -133,6 +133,29 @@ def _parse_file_info_from_line(line):
         return None, None
 
 
+def _yield_candidate_if_match(full_path, file_size, patterns, candidate_type):
+    """Yields a candidate tuple if the path matches any of the given patterns."""
+    lower_path = full_path.lower()
+    for pattern in patterns:
+        if re.search(pattern, lower_path):
+            if os.environ.get("DEBUG"):
+                print(f"Debug: {candidate_type.capitalize()} candidate: {full_path} (size:{file_size})")
+            yield candidate_type, (full_path, file_size)
+            break
+
+
+def _process_file_line(line, current_directory, kernel_patterns, initrd_patterns):
+    """Parses a file line and yields kernel/initrd candidates if found."""
+    filename, file_size = _parse_file_info_from_line(line)
+    if not filename or not file_size or file_size < 100_000:
+        return
+
+    full_path = os.path.join('/', current_directory, filename).replace('\\', '/').replace('//', '/')
+
+    yield from _yield_candidate_if_match(full_path, file_size, kernel_patterns, 'kernel')
+    yield from _yield_candidate_if_match(full_path, file_size, initrd_patterns, 'initrd')
+
+
 def _find_candidates_in_block(block, kernel_patterns, initrd_patterns):
     """Yields kernel and initrd candidates found in a single isoinfo block."""
     lines = block.splitlines()
@@ -141,26 +164,7 @@ def _find_candidates_in_block(block, kernel_patterns, initrd_patterns):
         return
 
     for line in lines:
-        filename, file_size = _parse_file_info_from_line(line)
-        if not filename or not file_size or file_size < 100_000:
-            continue
-
-        full_path = os.path.join('/', current_directory, filename).replace('\\', '/').replace('//', '/')
-        lower_path = full_path.lower()
-
-        for pattern in kernel_patterns:
-            if re.search(pattern, lower_path):
-                if os.environ.get("DEBUG"):
-                    print(f"Debug: Kernel candidate: {full_path} (size:{file_size})")
-                yield 'kernel', (full_path, file_size)
-                break
-
-        for pattern in initrd_patterns:
-            if re.search(pattern, lower_path):
-                if os.environ.get("DEBUG"):
-                    print(f"Debug: Initrd candidate: {full_path} (size:{file_size})")
-                yield 'initrd', (full_path, file_size)
-                break
+        yield from _process_file_line(line, current_directory, kernel_patterns, initrd_patterns)
 
 
 def _parse_isoinfo_listing(listing_output, kernel_patterns, initrd_patterns):
