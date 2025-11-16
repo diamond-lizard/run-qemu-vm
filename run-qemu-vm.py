@@ -43,17 +43,20 @@ import shutil
 import tempfile
 from pathlib import Path
 import re
-import select
-import termios
-import tty
 import socket
 import time
 import threading
 import platform
-import fcntl
-import signal
-import struct
 import asyncio
+from collections import deque
+
+from prompt_toolkit.application import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout.containers import Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.layout import Layout
+from prompt_toolkit.shortcuts import button_dialog
+from prompt_toolkit.formatted_text import to_formatted_text
 
 # --- Global Configuration & Executable Paths ---
 
@@ -520,267 +523,151 @@ def create_and_run_uefi_with_automation(base_args, config):
         run_qemu(base_args, config)
 
 
-class AsyncConsoleManager:
-    """Manages an asyncio-based text console session for QEMU."""
-    def __init__(self, loop, qemu_process, pty_device, monitor_socket_path):
-        self.loop = loop
-        self.qemu_process = qemu_process
-        self.pty_device = pty_device
-        self.monitor_socket_path = monitor_socket_path
 
-        self.stdin_fd = sys.stdin.fileno()
-        self.stdout_fd = sys.stdout.fileno()
-        self.pty_fd = -1
-        self.monitor_sock = None
 
-        self.original_settings = None
-        self.current_mode = MODE_SERIAL_CONSOLE
-        self.shutdown_event = asyncio.Event()
+async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_path):
+    """Manages a prompt_toolkit-based text console session for QEMU."""
+    output_buffer = deque(maxlen=2000)
+    current_mode = [MODE_SERIAL_CONSOLE]  # Use a list to allow modification from closures
 
-    def restore_terminal(self):
-        """Restores the terminal to its original state."""
-        if self.original_settings:
-            termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN, self.original_settings)
+    try:
+        pty_fd = os.open(pty_device, os.O_RDWR | os.O_NOCTTY)
+    except FileNotFoundError:
+        print(f"Error: PTY device '{pty_device}' not found.", file=sys.stderr)
+        return 1
+
+    monitor_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    monitor_sock.setblocking(False)
+    try:
+        await asyncio.get_running_loop().sock_connect(monitor_sock, monitor_socket_path)
+    except (FileNotFoundError, ConnectionRefusedError):
+        print("Warning: Could not connect to QEMU monitor.", file=sys.stderr)
+        monitor_sock = None # Disable monitor functionality
+
+    key_bindings = KeyBindings()
+
+    @key_bindings.add('c-]')
+    async def _(event):
+        app = event.app
+        result = await button_dialog(
+            title="Control Menu",
+            text="Select an action:",
+            buttons=[
+                ('Resume Console', 'resume'),
+                ('Enter Monitor', 'monitor'),
+                ('Quit QEMU', 'quit')
+            ]
+        ).run_async()
+
+        if result == 'quit':
+            if monitor_sock:
+                try:
+                    monitor_sock.send(b'quit\n')
+                    await asyncio.sleep(0.1)
+                except OSError:
+                    pass # Socket might be closed
+            app.exit(result="User quit")
+        elif result == 'monitor':
+            current_mode[0] = MODE_QEMU_MONITOR
+            output_buffer.append("\n--- Switched to QEMU Monitor (Ctrl-] for menu) ---")
+            app.invalidate()
+        else:  # resume
+            current_mode[0] = MODE_SERIAL_CONSOLE
+            output_buffer.append("\n--- Resumed Serial Console ---")
+            app.invalidate()
+
+    @key_bindings.add('<any>')
+    def _(event):
         try:
-            self.loop.remove_signal_handler(signal.SIGWINCH)
-        except (ValueError, RuntimeError):
-            pass # Handler might already be removed
-        print("\nTerminal restored.", flush=True)
+            if current_mode[0] == MODE_SERIAL_CONSOLE:
+                os.write(pty_fd, event.data.encode('utf-8', errors='replace'))
+            elif current_mode[0] == MODE_QEMU_MONITOR and monitor_sock:
+                monitor_sock.send(event.data.encode('utf-8', errors='replace'))
+        except OSError:
+            pass # Ignore write errors if PTY/socket is closed
 
-    def _handle_winch(self):
-        """SIGWINCH handler to propagate terminal resize to the PTY."""
-        try:
-            # To combat screen corruption on resize, especially when shrinking, we
-            # first clear the host terminal screen.
-            os.write(self.stdout_fd, b'\x1b[2J\x1b[H') # Clear screen and home cursor
+    def get_output_text():
+        return to_formatted_text('\n'.join(output_buffer))
 
-            # Then, we propagate the new terminal size to the guest's PTY.
-            rows, cols = os.get_terminal_size(self.stdin_fd)
-            winsize = struct.pack("HHHH", rows, cols, 0, 0)
-            fcntl.ioctl(self.pty_fd, termios.TIOCSWINSZ, winsize)
+    layout = Layout(container=Window(content=FormattedTextControl(text=get_output_text)))
+    app = Application(layout=layout, key_bindings=key_bindings, full_screen=True)
 
-            # Finally, we send a Ctrl-L to the guest to hint that it should
-            # perform a full screen redraw on the now-cleared terminal.
-            if self.current_mode == MODE_SERIAL_CONSOLE and self.pty_fd != -1:
-                os.write(self.pty_fd, b'\x0c')
-        except (OSError, AttributeError):
-            pass
-
-    def force_redraw(self):
-        """Sends a Ctrl-L to the PTY to force a screen refresh."""
-        if self.current_mode == MODE_SERIAL_CONSOLE and self.pty_fd != -1:
+    async def read_from_pty():
+        loop = asyncio.get_running_loop()
+        while True:
             try:
-                os.write(self.pty_fd, b'\x0c')
-            except OSError:
-                pass
-
-    def _handle_stdin(self):
-        """Callback for when there is data to read from stdin."""
-        try:
-            data = os.read(self.stdin_fd, 1024)
-            if b'\x1d' in data:  # Ctrl-]
-                self.loop.create_task(self.show_control_menu())
+                data = await loop.run_in_executor(None, os.read, pty_fd, 4096)
+                if not data:
+                    app.exit(result="PTY closed")
+                    return
+                # Handle incoming data as a stream to prevent garbled output from partial reads.
+                text = data.decode('utf-8', errors='replace').replace('\r', '')
+                lines = text.split('\n')
+                if not output_buffer:
+                    output_buffer.extend(lines)
+                else:
+                    output_buffer[-1] += lines[0]
+                    if len(lines) > 1:
+                        output_buffer.extend(lines[1:])
+                app.invalidate()
+            except Exception:
+                app.exit(result="PTY Error")
                 return
 
-            if self.current_mode == MODE_SERIAL_CONSOLE and self.pty_fd != -1:
-                os.write(self.pty_fd, data.replace(b'\x7f', b'\x08')) # Backspace fix
-            elif self.current_mode == MODE_QEMU_MONITOR and self.monitor_sock:
-                self.monitor_sock.send(data)
-        except BlockingIOError:
-            pass  # Expected if the event loop triggers spuriously.
-        except OSError as e:
-            print(f"Stdin read error: {e}", file=sys.stderr)
-            self.shutdown_event.set()
-
-    def _handle_pty(self):
-        """Callback for when there is data to read from the PTY."""
-        try:
-            data = os.read(self.pty_fd, 4096)
-            if data:
-                os.write(self.stdout_fd, data)
-            else: # EOF
-                self.shutdown_event.set()
-        except BlockingIOError:
-            pass  # Expected if the event loop triggers spuriously.
-        except OSError as e:
-            print(f"PTY read error: {e}", file=sys.stderr)
-            self.shutdown_event.set()
-
-    def _handle_monitor(self):
-        """Callback for when there is data to read from the QEMU monitor."""
-        try:
-            data = self.monitor_sock.recv(4096)
-            if data:
-                os.write(self.stdout_fd, data)
-            else: # EOF
-                self.shutdown_event.set()
-        except BlockingIOError:
-            pass  # Expected if the event loop triggers spuriously.
-        except OSError as e:
-            print(f"Monitor socket read error: {e}", file=sys.stderr)
-            self.shutdown_event.set()
-
-    async def show_control_menu(self):
-        """Pauses I/O, shows the control menu, and acts on user choice."""
-        self.pause_readers()
-        # Restore terminal to cooked mode to print menu, then switch to cbreak for input.
-        termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN, self.original_settings)
-
-        # Temporarily set stdin to blocking mode for menu input.
-        flags = fcntl.fcntl(self.stdin_fd, fcntl.F_GETFL)
-        fcntl.fcntl(self.stdin_fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
-
-        try:
-            print("\n╔════════════════════════════════════╗\n║ run-qemu-vm.py Control Menu        ║\n╠════════════════════════════════════╣\n║ q - Quit QEMU and exit             ║\n║ m - Enter QEMU monitor             ║\n║ r - Resume serial console          ║\n╚════════════════════════════════════╝\nChoice: ", end='', flush=True)
-
-            # Switch to cbreak to read a single character without waiting for Enter.
-            tty.setcbreak(self.stdin_fd)
-            termios.tcflush(self.stdin_fd, termios.TCIFLUSH)
-            choice_bytes = await self.loop.run_in_executor(None, os.read, self.stdin_fd, 1)
-            choice = choice_bytes.decode('utf-8', errors='ignore')
-        finally:
-            # Restore terminal to original cooked settings and non-blocking mode.
-            termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN, self.original_settings)
-            fcntl.fcntl(self.stdin_fd, fcntl.F_SETFL, flags)
-
-        if choice.lower() == 'q':
-            await self.quit_qemu()
+    async def read_from_monitor():
+        if not monitor_sock:
             return
-
-        if choice.lower() == 'm':
-            self.current_mode = MODE_QEMU_MONITOR
-            print("\nEntering QEMU monitor (Ctrl-] for menu)... \n(qemu) ", end='', flush=True)
-        else:
-            self.current_mode = MODE_SERIAL_CONSOLE
-            print("\nResuming serial console...", flush=True)
-
-        tty.setraw(self.stdin_fd)
-        self.resume_readers()
-
-    async def quit_qemu(self):
-        """Sends the quit command to the monitor and signals for shutdown."""
-        print("\nShutting down VM...", flush=True)
-        if self.monitor_sock:
+        loop = asyncio.get_running_loop()
+        while True:
             try:
-                self.monitor_sock.send(b"quit\n")
-            except OSError:
-                pass # Socket might already be closed
-        self.shutdown_event.set()
+                data = await loop.sock_recv(monitor_sock, 4096)
+                if not data:
+                    return # Monitor connection closed, but don't exit app
+                # Handle incoming data as a stream to prevent garbled output from partial reads.
+                text = data.decode('utf-8', errors='replace').replace('\r', '')
+                lines = text.split('\n')
+                if not output_buffer:
+                    output_buffer.extend(lines)
+                else:
+                    output_buffer[-1] += lines[0]
+                    if len(lines) > 1:
+                        output_buffer.extend(lines[1:])
+                app.invalidate()
+            except Exception:
+                return
 
-    def pause_readers(self):
-        self.loop.remove_reader(self.stdin_fd)
-        if self.current_mode == MODE_SERIAL_CONSOLE:
-            if self.pty_fd != -1: self.loop.remove_reader(self.pty_fd)
-        elif self.current_mode == MODE_QEMU_MONITOR:
-            if self.monitor_sock: self.loop.remove_reader(self.monitor_sock)
+    pty_reader_task = asyncio.create_task(read_from_pty())
+    monitor_reader_task = asyncio.create_task(read_from_monitor())
 
-    def resume_readers(self):
-        self.loop.add_reader(self.stdin_fd, self._handle_stdin)
-        if self.current_mode == MODE_SERIAL_CONSOLE:
-            if self.pty_fd != -1: self.loop.add_reader(self.pty_fd, self._handle_pty)
-        elif self.current_mode == MODE_QEMU_MONITOR:
-            if self.monitor_sock: self.loop.add_reader(self.monitor_sock, self._handle_monitor)
-
-    async def watch_qemu_process(self):
-        """Polls the QEMU process and sets the shutdown event when it exits."""
-        while self.qemu_process.poll() is None:
-            await asyncio.sleep(0.5)
-        self.shutdown_event.set()
-
-    async def setup(self):
-        """Initializes the console, PTY, and monitor connections asynchronously."""
-        try:
-            # 1. Open PTY device
-            for i in range(20):
-                try:
-                    self.pty_fd = os.open(self.pty_device, os.O_RDWR | os.O_NOCTTY)
-                    break
-                except FileNotFoundError:
-                    if i == 0: print(f"Info: PTY device '{self.pty_device}' not yet available, retrying...", flush=True)
-                    await asyncio.sleep(0.1)
-            if self.pty_fd == -1:
-                print(f"Error: Timed out waiting for PTY device '{self.pty_device}'.", file=sys.stderr)
-                return False
-
-            # Configure PTY for raw-like communication. This is critical for
-            # ensuring control characters and terminal resize events are passed
-            # through correctly without being interpreted by the host's TTY driver.
-            attrs = termios.tcgetattr(self.pty_fd)
-            attrs[0] = attrs[1] = attrs[3] = 0  # iflag, oflag, lflag
-            attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL # cflag
-            termios.tcsetattr(self.pty_fd, termios.TCSANOW, attrs)
-
-            # 2. Connect to QEMU monitor socket
-            self.monitor_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.monitor_sock.setblocking(False)
-            for i in range(20):
-                try:
-                    await self.loop.sock_connect(self.monitor_sock, self.monitor_socket_path)
-                    break
-                except (FileNotFoundError, ConnectionRefusedError):
-                    await asyncio.sleep(0.1)
-                except Exception:
-                    if i == 19: print("Warning: Could not connect to QEMU monitor.", file=sys.stderr)
-
-            # 3. Set up terminal
-            self.original_settings = termios.tcgetattr(self.stdin_fd)
-            tty.setraw(self.stdin_fd)
-
-            # 4. Set up signal handler for terminal resize
-            self.loop.add_signal_handler(signal.SIGWINCH, self._handle_winch)
-            self._handle_winch() # Set initial size
-
-            # 5. Start I/O readers
-            self.resume_readers()
-
-            # HACK: Some applications (like the Debian installer) don't draw their
-            # initial screen over serial until they receive some input or a signal.
-            # Schedule a Ctrl-L to be sent after a delay to trigger a redraw.
-            # A longer delay (1.5s) gives the guest OS more time to initialize.
-            self.loop.call_later(1.5, self.force_redraw)
-
-            print(f"\nConnected to serial console: {self.pty_device}\nPress Ctrl-] for control menu.\n", flush=True)
-            return True
-        except Exception as e:
-            print(f"Error setting up text console: {e}", file=sys.stderr)
-            if self.original_settings: self.restore_terminal()
-            return False
-
-async def start_async_console_session(qemu_process, pty_device, monitor_socket):
-    """Main async function to set up and run the console manager."""
-    loop = asyncio.get_running_loop()
-    console = AsyncConsoleManager(loop, qemu_process, pty_device, monitor_socket)
-
+    return_code = 0
     try:
-        if not await console.setup():
-            return 1
+        print(f"\nConnected to serial console: {pty_device}\nPress Ctrl-] for control menu.\n", flush=True)
+        # HACK: Send Ctrl-L after a delay to force a redraw in some guest OSes
+        await asyncio.sleep(1.5)
+        if current_mode[0] == MODE_SERIAL_CONSOLE:
+             os.write(pty_fd, b'\x0c')
 
-        # Run two tasks concurrently: one watching for QEMU exit, one for user shutdown signal
-        qemu_watcher = loop.create_task(console.watch_qemu_process())
-        shutdown_waiter = loop.create_task(console.shutdown_event.wait())
-
-        done, pending = await asyncio.wait(
-            [qemu_watcher, shutdown_waiter],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-
-        for task in pending:
-            task.cancel()
-
-    except asyncio.CancelledError:
-        pass # Normal on shutdown
+        result = await app.run_async() or ""
+        print(f"Exiting console session: {result}")
+    except Exception as e:
+        print(f"Error running prompt_toolkit application: {e}", file=sys.stderr)
+        return_code = 1
     finally:
-        console.restore_terminal()
-        if console.pty_fd != -1: os.close(console.pty_fd)
-        if console.monitor_sock: console.monitor_sock.close()
+        pty_reader_task.cancel()
+        monitor_reader_task.cancel()
+        if pty_fd != -1: os.close(pty_fd)
+        if monitor_sock: monitor_sock.close()
 
-    try:
-        qemu_process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        qemu_process.kill()
-        qemu_process.wait()
+        try:
+            qemu_process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            qemu_process.kill()
+            qemu_process.wait()
 
-    return qemu_process.returncode or 0
+        return_code = qemu_process.returncode or 0
+
+    return return_code
+
 
 def parse_pty_device_from_thread(process, event, result_holder):
     """Reads from process output in a thread, finds PTY device, and drains output."""
@@ -926,10 +813,11 @@ def run_qemu(args, config):
                 thread.join()
                 sys.exit(1)
 
-            # Hand off to the async console manager
+            # Hand off to the prompt_toolkit console manager
             try:
-                return_code = asyncio.run(start_async_console_session(process, holder[0], config['monitor_socket']))
+                return_code = asyncio.run(run_prompt_toolkit_console(process, holder[0], config['monitor_socket']))
             except KeyboardInterrupt:
+                # This is a fallback; prompt_toolkit should handle Ctrl-C gracefully.
                 print("\nInterrupted by user.", flush=True)
                 return_code = 130
             finally:
