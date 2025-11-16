@@ -38,10 +38,7 @@ def build_qemu_args(config):
         args.extend(["-cdrom", config["cdrom"]])
     if config.get("share_dir"):
         host_path, mount_tag = parse_share_dir_argument(config["share_dir"])
-        if host_path and mount_tag:
-            args.extend(["-virtfs", f"local,path={host_path},mount_tag={mount_tag},security_model={app_config.VIRTFS_SECURITY_MODEL},id={mount_tag}"])
-        else:
-            sys.exit(1)
+        args.extend(["-virtfs", f"local,path={host_path},mount_tag={mount_tag},security_model={app_config.VIRTFS_SECURITY_MODEL},id={mount_tag}"])
 
     # --- NEW: Direct Kernel Boot Attempt for text console (Linux only) ---
     is_linux = platform.system() == 'Linux'

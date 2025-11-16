@@ -28,8 +28,6 @@ SMP_CORES = 4
 UEFI_CODE_PATH = None
 # The path to the UEFI variables file, for persistent settings; auto-generated if not specified.
 UEFI_VARS_PATH = None
-# The virtual graphics device to use in GUI mode; auto-selected if not specified.
-GRAPHICS_DEVICE = None
 # The QEMU display configuration string for GUI mode.
 DISPLAY_TYPE = "default,show-cursor=on"
 # The virtual USB controller model.
@@ -75,11 +73,9 @@ NETWORK_DEVICE = f"virtio-net-pci,netdev={NETWORK_ID}"
 
 # --- Directory Sharing Configuration ---
 VIRTFS_SECURITY_MODEL = "mapped-xattr"
-VIRTFS_VERSION = "9p2000.L"
 MOUNT_TAG_PATTERN = r'^[a-zA-Z0-9_]+$'
 MOUNT_TAG_ALLOWED_CHARS = "letters (a-z, A-Z), numbers (0-9), and underscores (_)"
 
 # --- Text Console Mode Constants ---
 MODE_SERIAL_CONSOLE = 'serial_console'
-MODE_CONTROL_MENU = 'control_menu'
 MODE_QEMU_MONITOR = 'qemu_monitor'

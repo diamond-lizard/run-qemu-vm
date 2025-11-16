@@ -20,14 +20,6 @@ def get_qemu_prefix(brew_executable):
         print(f"Error: Could not find QEMU prefix using '{brew_executable}'. Is Homebrew installed? Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-def detect_firmware_type(iso_path, architecture):
-    """Detects the firmware type for an ISO based on architecture and filename."""
-    if not iso_path:
-        return 'uefi' if architecture in ['aarch64', 'x86_64', 'riscv64'] else 'bios'
-    if 'bios' in Path(iso_path).name.lower():
-         return 'bios'
-    return 'uefi' if architecture in ['aarch64', 'x86_64', 'riscv64'] else 'uefi'
-
 
 def find_uefi_bootloader(seven_zip_executable, iso_path, architecture):
     """Inspects an ISO to find the UEFI bootloader file for the given architecture."""
