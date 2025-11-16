@@ -36,6 +36,28 @@ class AnsiColorProcessor(Processor):
         self._parsed_fragments = []
         self._last_raw_length = 0
 
+    def _invalidate_cache_if_needed(self, current_length: int):
+        """Invalidates fragment cache if buffer is shortened."""
+        if current_length < self._last_raw_length:
+            self._parsed_fragments = []
+            self._last_raw_length = 0
+
+    def _process_new_text_to_fragments(self, new_raw_text: str):
+        """Converts new raw text into a list of formatted fragments."""
+        new_fragments = []
+        lines = new_raw_text.split("\n")
+
+        for i, line in enumerate(lines):
+            # Process each line for ANSI codes
+            if line:
+                line_fragments = to_formatted_text(ANSI(line))
+                new_fragments.extend(line_fragments)
+
+            # Add explicit newline fragment after every line except the last
+            if i < len(lines) - 1:
+                new_fragments.append(("", "\n"))
+        return new_fragments
+
     def apply_transformation(
         self, transformation_input: TransformationInput
     ) -> Transformation:
@@ -46,27 +68,11 @@ class AnsiColorProcessor(Processor):
         full_text = transformation_input.document.text
         current_length = len(full_text)
 
-        # Invalidate cache if buffer was cleared or shortened
-        if current_length < self._last_raw_length:
-            self._parsed_fragments = []
-            self._last_raw_length = 0
+        self._invalidate_cache_if_needed(current_length)
 
-        # Process only the new text
         new_raw_text = full_text[self._last_raw_length :]
         if new_raw_text:
-            new_fragments = []
-            lines = new_raw_text.split("\n")
-
-            for i, line in enumerate(lines):
-                # Process each line for ANSI codes (even if empty)
-                if line:
-                    line_fragments = to_formatted_text(ANSI(line))
-                    new_fragments.extend(line_fragments)
-
-                # Add explicit newline fragment after every line except the last
-                if i < len(lines) - 1:
-                    new_fragments.append(("", "\n"))
-
+            new_fragments = self._process_new_text_to_fragments(new_raw_text)
             self._parsed_fragments.extend(new_fragments)
             self._last_raw_length = current_length
 
@@ -248,6 +254,12 @@ def _create_console_layout(log_buffer, get_pty_screen_fragments, current_mode):
     return Layout(HSplit([pty_container, monitor_container]))
 
 
+async def _log_task_error(log_queue: Queue, task_name: str, error_type: str = "ERROR"):
+    """Logs a traceback for a crashed asyncio task."""
+    tb_str = traceback.format_exc()
+    await log_queue.put(f"\n--- {task_name} {error_type} ---\n{tb_str}")
+
+
 async def _read_from_pty(app, pty_fd, pyte_stream, log_queue):
     """Reads data from the PTY, feeds it to the terminal emulator, and invalidates the app."""
     loop = asyncio.get_running_loop()
@@ -265,8 +277,7 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue):
                 break
 
             # For any other exception, log it as a crash.
-            tb_str = traceback.format_exc()
-            await log_queue.put(f"\n--- PTY READER CRASHED ---\n{tb_str}")
+            await _log_task_error(log_queue, "PTY READER", "CRASHED")
             # Don't exit, allow monitor to be used for diagnostics.
             return
 
@@ -284,8 +295,7 @@ async def _read_from_monitor(monitor_sock, log_queue):
             text = data.decode("utf-8", errors="replace")
             await log_queue.put(text)
         except Exception:
-            tb_str = traceback.format_exc()
-            await log_queue.put(f"\n--- MONITOR ERROR ---\n{tb_str}")
+            await _log_task_error(log_queue, "MONITOR", "ERROR")
             return
 
 
@@ -301,16 +311,22 @@ async def _log_merger(log_queue, log_buffer, app):
             break
 
 
-def _cleanup_console(qemu_process, tasks, pty_fd, monitor_sock):
-    """Cancels all running async tasks and closes open resources."""
+def _cancel_async_tasks(tasks):
+    """Cancels all provided asyncio tasks."""
     for task in tasks:
         task.cancel()
 
+
+def _close_resources(pty_fd, monitor_sock):
+    """Closes the PTY file descriptor and monitor socket."""
     if pty_fd != -1:
         os.close(pty_fd)
     if monitor_sock:
         monitor_sock.close()
 
+
+def _terminate_qemu_process(qemu_process):
+    """Waits for the QEMU process to exit, killing it if necessary."""
     try:
         qemu_process.wait(timeout=2)
     except subprocess.TimeoutExpired:
@@ -318,25 +334,77 @@ def _cleanup_console(qemu_process, tasks, pty_fd, monitor_sock):
         qemu_process.wait()
 
 
-async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_path):
-    """Manages a prompt_toolkit-based text console session for QEMU."""
+def _cleanup_console(qemu_process, tasks, pty_fd, monitor_sock):
+    """Cancels all running async tasks and closes open resources."""
+    _cancel_async_tasks(tasks)
+    _close_resources(pty_fd, monitor_sock)
+    _terminate_qemu_process(qemu_process)
+
+
+def _initialize_console_state():
+    """Initializes all stateful components for the console session."""
     log_queue = Queue()
     log_buffer = Buffer(read_only=True)
     current_mode = [
         app_config.MODE_SERIAL_CONSOLE
-    ]  # Use a list to allow modification from closures
-
-    # --- Pyte Terminal Emulation State ---
+    ]  # List to be mutable from closures
     pyte_screen = pyte.Screen(80, 24)
     pyte_stream = pyte.ByteStream(pyte_screen)
+    return log_queue, log_buffer, current_mode, pyte_screen, pyte_stream
+
+
+def _setup_console_app(
+    current_mode, log_queue, pty_fd, monitor_sock, log_buffer, pyte_screen
+):
+    """Creates and configures the prompt_toolkit Application."""
 
     def get_pty_screen_fragments():
         """Wrapper to pass pyte_screen to the fragment generator."""
         return _get_pty_screen_fragments(pyte_screen)
 
-    def append_to_log(text_to_append: str):
-        """Wrapper to pass log_buffer to the append helper."""
-        _append_to_log(log_buffer, text_to_append)
+    key_bindings = _create_key_bindings(current_mode, log_queue, pty_fd, monitor_sock)
+    layout = _create_console_layout(log_buffer, get_pty_screen_fragments, current_mode)
+    app = Application(layout=layout, key_bindings=key_bindings, full_screen=True)
+    return app
+
+
+def _create_async_tasks(app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer):
+    """Creates and returns all background asyncio tasks."""
+    pty_reader_task = asyncio.create_task(
+        _read_from_pty(app, pty_fd, pyte_stream, log_queue)
+    )
+    monitor_reader_task = asyncio.create_task(
+        _read_from_monitor(monitor_sock, log_queue)
+    )
+    merger_task = asyncio.create_task(_log_merger(log_queue, log_buffer, app))
+    return [pty_reader_task, monitor_reader_task, merger_task]
+
+
+async def _run_application_loop(app, pty_device, current_mode, pty_fd):
+    """Runs the main loop of the prompt_toolkit application, handling startup and shutdown."""
+    print(
+        f"\nConnected to serial console: {pty_device}\nPress Ctrl-] for control menu.\n",
+        flush=True,
+    )
+    # HACK: Send Ctrl-L after a delay to force a redraw in some guest OSes
+    await asyncio.sleep(1.5)
+    if current_mode[0] == app_config.MODE_SERIAL_CONSOLE:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, os.write, pty_fd, b"\x0c")
+
+    result = await app.run_async() or ""
+    print(f"Exiting console session: {result}")
+
+
+async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_path):
+    """Manages a prompt_toolkit-based text console session for QEMU."""
+    (
+        log_queue,
+        log_buffer,
+        current_mode,
+        pyte_screen,
+        pyte_stream,
+    ) = _initialize_console_state()
 
     try:
         pty_fd = _open_pty_device(pty_device)
@@ -345,31 +413,17 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
 
     monitor_sock = await _connect_to_monitor(monitor_socket_path)
 
-    key_bindings = _create_key_bindings(current_mode, log_queue, pty_fd, monitor_sock)
-    layout = _create_console_layout(log_buffer, get_pty_screen_fragments, current_mode)
-    app = Application(layout=layout, key_bindings=key_bindings, full_screen=True)
-
-    pty_reader_task = asyncio.create_task(
-        _read_from_pty(app, pty_fd, pyte_stream, log_queue)
+    app = _setup_console_app(
+        current_mode, log_queue, pty_fd, monitor_sock, log_buffer, pyte_screen
     )
-    monitor_reader_task = asyncio.create_task(_read_from_monitor(monitor_sock, log_queue))
-    merger_task = asyncio.create_task(_log_merger(log_queue, log_buffer, app))
-    tasks = [pty_reader_task, monitor_reader_task, merger_task]
+
+    tasks = _create_async_tasks(
+        app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer
+    )
 
     return_code = 0
     try:
-        print(
-            f"\nConnected to serial console: {pty_device}\nPress Ctrl-] for control menu.\n",
-            flush=True,
-        )
-        # HACK: Send Ctrl-L after a delay to force a redraw in some guest OSes
-        await asyncio.sleep(1.5)
-        if current_mode[0] == app_config.MODE_SERIAL_CONSOLE:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, os.write, pty_fd, b"\x0c")
-
-        result = await app.run_async() or ""
-        print(f"Exiting console session: {result}")
+        await _run_application_loop(app, pty_device, current_mode, pty_fd)
     except Exception as e:
         print(f"Error running prompt_toolkit application: {e}", file=sys.stderr)
         return_code = 1
