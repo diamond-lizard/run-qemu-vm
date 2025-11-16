@@ -182,34 +182,54 @@ def _parse_isoinfo_listing(listing_output, kernel_patterns, initrd_patterns):
     return candidate_kernels, candidate_initrds
 
 
+def _get_isoinfo_listing_output(isoinfo_path, iso_path):
+    """Runs isoinfo to get a recursive directory listing of an ISO."""
+    try:
+        result = subprocess.run(
+            [isoinfo_path, '-R', '-l', '-i', iso_path],
+            capture_output=True, text=True, check=True, encoding='latin-1', errors='ignore'
+        )
+        return result.stdout, None
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        return None, f"isoinfo failed ({e})"
+
+
+def _select_best_boot_candidates(candidate_kernels, candidate_initrds):
+    """Sorts and selects the best kernel and initrd candidates."""
+    if not candidate_kernels or not candidate_initrds:
+        return None, None
+
+    # Sort by path depth (shallower is better) and then by size (larger is better)
+    candidate_kernels.sort(key=lambda x: (x[0].count('/'), -x[1]))
+    candidate_initrds.sort(key=lambda x: (x[0].count('/'), -x[1]))
+
+    best_kernel = candidate_kernels[0][0]
+    best_initrd = candidate_initrds[0][0]
+
+    print(f"Info: Best kernel candidate: {best_kernel}")
+    print(f"Info: Best initrd candidate: {best_initrd}")
+
+    return best_kernel, best_initrd
+
+
 def _find_kernel_initrd_with_isoinfo(iso_path, kernel_patterns, initrd_patterns):
     """Tries to find kernel and initrd in an ISO using isoinfo."""
     isoinfo_path = shutil.which("isoinfo")
     if not isoinfo_path:
         return None, None, "isoinfo not found"
 
-    try:
-        result = subprocess.run(
-            [isoinfo_path, '-R', '-l', '-i', iso_path],
-            capture_output=True, text=True, check=True, encoding='latin-1', errors='ignore'
-        )
-        candidate_kernels, candidate_initrds = _parse_isoinfo_listing(result.stdout, kernel_patterns, initrd_patterns)
+    listing_output, error = _get_isoinfo_listing_output(isoinfo_path, iso_path)
+    if error:
+        return None, None, error
 
-        if not candidate_kernels or not candidate_initrds:
-            return None, None, "isoinfo (candidates not found)"
+    candidate_kernels, candidate_initrds = _parse_isoinfo_listing(listing_output, kernel_patterns, initrd_patterns)
 
-        # Sort by path depth (shallower is better) and then by size (larger is better)
-        candidate_kernels.sort(key=lambda x: (x[0].count('/'), -x[1]))
-        candidate_initrds.sort(key=lambda x: (x[0].count('/'), -x[1]))
+    found_kernel, found_initrd = _select_best_boot_candidates(candidate_kernels, candidate_initrds)
 
-        found_kernel = candidate_kernels[0][0]
-        found_initrd = candidate_initrds[0][0]
-        print(f"Info: Best kernel candidate: {found_kernel}")
-        print(f"Info: Best initrd candidate: {found_initrd}")
+    if found_kernel and found_initrd:
         return found_kernel, found_initrd, "isoinfo"
-
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        return None, None, f"isoinfo failed ({e})"
+    else:
+        return None, None, "isoinfo (candidates not found)"
 
 
 def _find_kernel_initrd_with_7z(seven_zip_executable, iso_path, kernel_patterns, initrd_patterns):
