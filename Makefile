@@ -1,4 +1,4 @@
-.PHONY: help ruff
+.PHONY: help ruff test
 .DEFAULT_GOAL := help
 
 help: ## Display this help message
@@ -7,3 +7,6 @@ help: ## Display this help message
 
 ruff: ## Run ruff linter
 	ruff check run_qemu_vm
+
+test: ruff ## Run tests using pytest
+	pytest
