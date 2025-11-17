@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import socket
 import subprocess
@@ -26,6 +27,7 @@ from prompt_toolkit.layout.processors import (
 from prompt_toolkit.shortcuts import button_dialog
 
 from . import config as app_config
+from .acs_translator import ACSTranslator
 
 
 class AnsiColorProcessor(Processor):
@@ -307,9 +309,12 @@ async def _log_task_error(log_queue: Queue, task_name: str, error_type: str = "E
     await log_queue.put(f"\n--- {task_name} {error_type} ---\n{tb_str}")
 
 
-def _process_pty_data(data, app, pyte_stream):
-    """Feeds PTY data to the stream and invalidates the app."""
-    pyte_stream.feed(data.decode("utf-8", "replace"))
+def _process_pty_data(data, app, pyte_stream, acs_translator):
+    """Translates ACS sequences, feeds PTY data to the stream, and invalidates the app."""
+    # First, translate any DEC Special Graphics (ACS) sequences to Unicode.
+    translated_data = acs_translator.translate(data)
+    # Then, decode the (potentially modified) data and feed it to pyte.
+    pyte_stream.feed(translated_data.decode("utf-8", "replace"))
     app.invalidate()
 
 
@@ -325,7 +330,7 @@ async def _handle_pty_read_error(e, log_queue):
     return False  # Indicates function should return
 
 
-async def _read_from_pty(app, pty_fd, pyte_stream, log_queue):
+async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, acs_translator):
     """Reads data from the PTY, feeds it to the terminal emulator, and invalidates the app."""
     loop = asyncio.get_running_loop()
     while True:
@@ -334,7 +339,7 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue):
             if not data:
                 app.exit(result="PTY closed")
                 return
-            _process_pty_data(data, app, pyte_stream)
+            _process_pty_data(data, app, pyte_stream, acs_translator)
         except Exception as e:
             should_break = await _handle_pty_read_error(e, log_queue)
             if should_break:
@@ -418,7 +423,8 @@ def _initialize_console_state():
     pyte_stream = pyte.Stream(pyte_screen)
     monitor_pyte_screen = pyte.Screen(80, 24)
     monitor_pyte_stream = pyte.Stream(monitor_pyte_screen)
-    return log_queue, log_buffer, current_mode, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream
+    acs_translator = ACSTranslator()
+    return log_queue, log_buffer, current_mode, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream, acs_translator
 
 
 def _setup_console_app(
@@ -440,10 +446,10 @@ def _setup_console_app(
     return app
 
 
-def _create_async_tasks(app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream):
+def _create_async_tasks(app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, acs_translator):
     """Creates and returns all background asyncio tasks."""
     pty_reader_task = asyncio.create_task(
-        _read_from_pty(app, pty_fd, pyte_stream, log_queue)
+        _read_from_pty(app, pty_fd, pyte_stream, log_queue, acs_translator)
     )
     monitor_reader_task = asyncio.create_task(
         _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue)
@@ -490,6 +496,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         pyte_stream,
         monitor_pyte_screen,
         monitor_pyte_stream,
+        acs_translator,
     ) = _initialize_console_state()
 
     try:
@@ -504,7 +511,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
     )
 
     tasks = _create_async_tasks(
-        app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream
+        app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, acs_translator
     )
 
     return await _manage_console_session(
