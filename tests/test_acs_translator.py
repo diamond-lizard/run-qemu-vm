@@ -64,7 +64,7 @@ def test_sequence_split_after_esc(translator: ACSTranslator):
     assert translator._buffer == b"\x1b"
     assert translator._state == AcsState.NORMAL
 
-    assert translator.translate(b"(0more") == b"more"
+    assert translator.translate(b"(0more") == "└⎺⎼␊".encode("utf-8")
     assert translator._buffer == b""
     assert translator._state == AcsState.ACS_MODE
 
@@ -75,7 +75,7 @@ def test_sequence_split_after_esc_paren(translator: ACSTranslator):
     assert translator._buffer == b"\x1b("
     assert translator._state == AcsState.NORMAL
 
-    assert translator.translate(b"0more") == b"more"
+    assert translator.translate(b"0more") == "└⎺⎼␊".encode("utf-8")
     assert translator._buffer == b""
     assert translator._state == AcsState.ACS_MODE
 
