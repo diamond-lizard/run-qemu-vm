@@ -306,12 +306,17 @@ async def _process_control_menu_choice(
         await _handle_resume_action(app, current_mode)
 
 
-async def _handle_control_menu(app, current_mode, monitor_sock):
+async def _handle_control_menu(app, current_mode, monitor_sock, menu_is_active):
     """Displays the control menu and handles the user's choice."""
-    result = await _show_control_menu()
-    await _process_control_menu_choice(
-        result, app, current_mode, monitor_sock
-    )
+    menu_is_active[0] = True
+    try:
+        result = await _show_control_menu()
+        await _process_control_menu_choice(
+            result, app, current_mode, monitor_sock
+        )
+    finally:
+        menu_is_active[0] = False
+        app.invalidate()
 
 
 async def _forward_input(event, current_mode, pty_fd, monitor_sock):
@@ -330,13 +335,13 @@ async def _forward_input(event, current_mode, pty_fd, monitor_sock):
         pass  # Ignore write errors if PTY/socket is closed
 
 
-def _create_key_bindings(current_mode, pty_fd, monitor_sock):
+def _create_key_bindings(current_mode, pty_fd, monitor_sock, menu_is_active):
     """Creates and configures the key bindings for the console application."""
     key_bindings = KeyBindings()
 
     @key_bindings.add("c-]", eager=True)
     async def _(event):
-        await _handle_control_menu(event.app, current_mode, monitor_sock)
+        await _handle_control_menu(event.app, current_mode, monitor_sock, menu_is_active)
 
     @key_bindings.add("<any>")
     async def _(event):
@@ -368,13 +373,14 @@ async def _log_task_error(log_queue: Queue, task_name: str, error_type: str = "E
     await log_queue.put(f"\n--- {task_name} {error_type} ---\n{tb_str}")
 
 
-def _process_pty_data(data, app, pyte_stream, acs_translator):
+def _process_pty_data(data, app, pyte_stream, acs_translator, menu_is_active):
     """Translates ACS sequences, feeds PTY data to the stream, and invalidates the app."""
     # First, translate any DEC Special Graphics (ACS) sequences to Unicode.
     translated_data = acs_translator.translate(data)
     # Then, decode the (potentially modified) data and feed it to pyte.
     pyte_stream.feed(translated_data.decode("utf-8", "replace"))
-    app.invalidate()
+    if not menu_is_active[0]:
+        app.invalidate()
 
 
 async def _handle_pty_read_error(e, log_queue):
@@ -389,7 +395,7 @@ async def _handle_pty_read_error(e, log_queue):
     return False  # Indicates function should return
 
 
-async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, acs_translator):
+async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, acs_translator, menu_is_active):
     """Reads data from the PTY, feeds it to the terminal emulator, and invalidates the app."""
     loop = asyncio.get_running_loop()
     while True:
@@ -398,7 +404,7 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, acs_translator):
             if not data:
                 app.exit(result="PTY closed")
                 return
-            _process_pty_data(data, app, pyte_stream, acs_translator)
+            _process_pty_data(data, app, pyte_stream, acs_translator, menu_is_active)
         except Exception as e:
             should_break = await _handle_pty_read_error(e, log_queue)
             if should_break:
@@ -407,13 +413,14 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, acs_translator):
                 return
 
 
-def _process_monitor_data(data, app, monitor_pyte_stream):
+def _process_monitor_data(data, app, monitor_pyte_stream, menu_is_active):
     """Feeds monitor data to the stream and invalidates the app."""
     monitor_pyte_stream.feed(data.decode("utf-8", "replace"))
-    app.invalidate()
+    if not menu_is_active[0]:
+        app.invalidate()
 
 
-async def _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue):
+async def _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue, menu_is_active):
     """Reads data from the QEMU monitor socket and feeds it to the monitor pyte stream."""
     if not monitor_sock:
         return
@@ -423,7 +430,7 @@ async def _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue):
             data = await loop.sock_recv(monitor_sock, 4096)
             if not data:
                 return  # Monitor connection closed, but don't exit app
-            _process_monitor_data(data, app, monitor_pyte_stream)
+            _process_monitor_data(data, app, monitor_pyte_stream, menu_is_active)
         except Exception:
             await _log_task_error(log_queue, "MONITOR", "ERROR")
             return
@@ -478,16 +485,17 @@ def _initialize_console_state():
     current_mode = [
         app_config.MODE_SERIAL_CONSOLE
     ]  # List to be mutable from closures
+    menu_is_active = [False]  # List to be mutable from closures
     pyte_screen = pyte.Screen(80, 24)
     pyte_stream = pyte.Stream(pyte_screen)
     monitor_pyte_screen = pyte.Screen(80, 24)
     monitor_pyte_stream = pyte.Stream(monitor_pyte_screen)
     acs_translator = ACSTranslator()
-    return log_queue, log_buffer, current_mode, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream, acs_translator
+    return log_queue, log_buffer, current_mode, menu_is_active, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream, acs_translator
 
 
 def _setup_console_app(
-    current_mode, pty_fd, monitor_sock, log_buffer, pyte_screen, monitor_pyte_screen
+    current_mode, pty_fd, monitor_sock, log_buffer, pyte_screen, monitor_pyte_screen, menu_is_active
 ):
     """Creates and configures the prompt_toolkit Application."""
 
@@ -499,19 +507,19 @@ def _setup_console_app(
         """Wrapper to pass monitor_pyte_screen to the fragment generator."""
         return _get_pty_screen_fragments(monitor_pyte_screen)
 
-    key_bindings = _create_key_bindings(current_mode, pty_fd, monitor_sock)
+    key_bindings = _create_key_bindings(current_mode, pty_fd, monitor_sock, menu_is_active)
     layout = _create_console_layout(get_pty_screen_fragments, get_monitor_screen_fragments, current_mode)
     app = Application(layout=layout, key_bindings=key_bindings, full_screen=True)
     return app
 
 
-def _create_async_tasks(app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, acs_translator):
+def _create_async_tasks(app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, acs_translator, menu_is_active):
     """Creates and returns all background asyncio tasks."""
     pty_reader_task = asyncio.create_task(
-        _read_from_pty(app, pty_fd, pyte_stream, log_queue, acs_translator)
+        _read_from_pty(app, pty_fd, pyte_stream, log_queue, acs_translator, menu_is_active)
     )
     monitor_reader_task = asyncio.create_task(
-        _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue)
+        _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue, menu_is_active)
     )
     merger_task = asyncio.create_task(_log_merger(log_queue, log_buffer, app))
     return [pty_reader_task, monitor_reader_task, merger_task]
@@ -551,6 +559,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         log_queue,
         log_buffer,
         current_mode,
+        menu_is_active,
         pyte_screen,
         pyte_stream,
         monitor_pyte_screen,
@@ -566,11 +575,11 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
     monitor_sock = await _connect_to_monitor(monitor_socket_path)
 
     app = _setup_console_app(
-        current_mode, pty_fd, monitor_sock, log_buffer, pyte_screen, monitor_pyte_screen
+        current_mode, pty_fd, monitor_sock, log_buffer, pyte_screen, monitor_pyte_screen, menu_is_active
     )
 
     tasks = _create_async_tasks(
-        app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, acs_translator
+        app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, acs_translator, menu_is_active
     )
 
     return await _manage_console_session(
