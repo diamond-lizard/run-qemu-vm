@@ -3,7 +3,9 @@ import os
 import socket
 import subprocess
 import sys
+import termios
 import traceback
+import tty
 from asyncio import Queue
 
 import pyte
@@ -88,45 +90,42 @@ def _get_char_style(char):
     return " ".join(style_parts)
 
 
-def _coalesce_char_into_fragment(char, current_text, current_style, line_fragments):
-    """
-    Coalesces a character into a text run if its style matches.
-
-    If the style differs, the current text run is added to the fragments list
-    and a new run is started with the given character.
-
-    Returns the updated text run and style.
-    """
-    style_str = _get_char_style(char)
-    # Access the character data directly from the Char object
-    char_data = char.data
-
-    if style_str == current_style:
-        current_text += char_data
-    else:
-        if current_text:
-            line_fragments.append((current_style, current_text))
-        current_text = char_data
-        current_style = style_str
-
-    return current_text, current_style
-
-
 def _process_line_to_fragments(y, pyte_screen):
-    """Processes a single line from the pyte screen into fragments."""
+    """
+    Processes a single line from the pyte screen into styled fragments.
+
+    This function combines the character data from `pyte_screen.display` (which
+    correctly translates ACS characters) with the style information from
+    `pyte_screen.buffer` to produce a list of `(style, text)` fragments.
+    """
     line_fragments = []
     current_text = ""
     current_style = ""  # Start with an empty style string
 
-    for x in range(pyte_screen.columns):
-        # Use two-level indexing: buffer[y][x] returns a Char object
-        # Note: buffer[y, x] (tuple indexing) returns StaticDefaultDict, which is incorrect
-        char = pyte_screen.buffer[y][x]
-        current_text, current_style = _coalesce_char_into_fragment(
-            char, current_text, current_style, line_fragments
-        )
+    # pyte_screen.display contains the rendered text, including ACS translations.
+    display_line = pyte_screen.display[y]
 
-    # After the loop, add any remaining text as the final fragment
+    for x in range(pyte_screen.columns):
+        # Get the character's style information from the buffer.
+        char_style_info = pyte_screen.buffer[y][x]
+
+        # Get the character's data from the display property.
+        # Pad with spaces if the display line is shorter than the screen width,
+        # as .display can have ragged right edges.
+        char_data = display_line[x] if x < len(display_line) else " "
+
+        style_str = _get_char_style(char_style_info)
+
+        # Coalesce characters with the same style into a single fragment.
+        if style_str == current_style:
+            current_text += char_data
+        else:
+            if current_text:
+                line_fragments.append((current_style, current_text))
+            current_text = char_data
+            current_style = style_str
+
+    # After the loop, add any remaining text as the final fragment.
     if current_text:
         line_fragments.append((current_style, current_text))
 
@@ -143,16 +142,6 @@ def _get_pty_screen_fragments(pyte_screen):
     return fragments
 
 
-def _sanitize_control_characters(text: str) -> str:
-    """Removes all ASCII control characters except for Tab and Line Feed."""
-    sanitized_chars = []
-    for char in text:
-        # Keep printable ASCII, Tab, and Line Feed
-        if char >= " " or char in ("\t", "\n"):
-            sanitized_chars.append(char)
-    return "".join(sanitized_chars)
-
-
 def _append_to_log(log_buffer: Buffer, text_to_append: str):
     """Appends text to the log buffer, bypassing the read-only protection."""
     current_doc = log_buffer.document
@@ -162,12 +151,21 @@ def _append_to_log(log_buffer: Buffer, text_to_append: str):
 
 
 def _open_pty_device(pty_device):
-    """Opens the PTY device file descriptor, returning it or raising FileNotFoundError."""
+    """Opens the PTY device file descriptor and sets it to raw mode."""
     try:
-        return os.open(pty_device, os.O_RDWR | os.O_NOCTTY)
+        pty_fd = os.open(pty_device, os.O_RDWR | os.O_NOCTTY)
     except FileNotFoundError:
         print(f"Error: PTY device '{pty_device}' not found.", file=sys.stderr)
         raise
+
+    try:
+        tty.setraw(pty_fd)
+    except termios.error as e:
+        print(f"Error setting raw mode on PTY device '{pty_device}': {e}", file=sys.stderr)
+        os.close(pty_fd)
+        raise
+
+    return pty_fd
 
 
 async def _connect_to_monitor(monitor_socket_path):
