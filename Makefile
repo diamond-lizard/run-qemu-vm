@@ -9,4 +9,4 @@ ruff: ## Run ruff linter
 	ruff check run_qemu_vm
 
 test: ruff ## Run tests using pytest
-	pytest -x
+	PYTHONPATH=. pytest -x
