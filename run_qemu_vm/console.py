@@ -23,7 +23,7 @@ from prompt_toolkit.layout.processors import (
     Transformation,
     TransformationInput,
 )
-from prompt_toolkit.shortcuts import button_dialog
+from prompt_toolkit.widgets import Button, Dialog
 
 from . import config as app_config
 from .acs_translator import ACSTranslator
@@ -182,16 +182,76 @@ async def _connect_to_monitor(monitor_socket_path):
 
 
 async def _show_control_menu():
-    """Displays the control menu and returns the user's choice."""
-    return await button_dialog(
+    """
+    Displays a custom control menu with single-key shortcuts.
+
+    This dialog allows the user to select an action using either mouse clicks,
+    arrow keys + Enter, or single-character shortcuts (R, E, Q).
+    """
+    # This variable will hold the Application instance. The button handlers
+    # close over it to be able to exit the dialog.
+    app = None
+
+    buttons_with_shortcuts = [
+        ("(R)esume Console", "resume", "r"),
+        ("(E)nter Monitor", "monitor", "e"),
+        ("(Q)uit QEMU", "quit", "q"),
+    ]
+
+    def create_handler(value):
+        """Creates a button handler that exits the app with a given result."""
+
+        def handler():
+            if app:
+                app.exit(result=value)
+
+        return handler
+
+    # Calculate the width needed for buttons.
+    # Find the longest button text and add padding for button decorations.
+    # Buttons typically need extra space for borders, padding, and focus indicators.
+    max_button_text_length = max(len(text) for text, _, _ in buttons_with_shortcuts)
+    # Add 4 characters for button padding/borders (2 on each side is typical)
+    button_width = max_button_text_length + 4
+
+    dialog_buttons = [
+        Button(text=text, handler=create_handler(value), width=button_width)
+        for text, value, _ in buttons_with_shortcuts
+    ]
+
+    key_bindings = KeyBindings()
+    for _, value, key in buttons_with_shortcuts:
+        # Use a lambda with a default argument to capture the value of `value`
+        # for each key binding.
+        key_bindings.add(key.lower(), eager=True)(
+            lambda event, v=value: event.app.exit(result=v)
+        )
+        key_bindings.add(key.upper(), eager=True)(
+            lambda event, v=value: event.app.exit(result=v)
+        )
+
+    # Create a body text that is at least as wide as the buttons to ensure
+    # the dialog allocates sufficient width. We pad the text to match the
+    # button width to give the layout engine a hint about minimum width.
+    body_text = "Select an action:".ljust(button_width)
+
+    dialog = Dialog(
         title="Control Menu",
-        text="Select an action:",
-        buttons=[
-            ("Resume Console", "resume"),
-            ("Enter Monitor", "monitor"),
-            ("Quit QEMU", "quit"),
-        ],
-    ).run_async()
+        body=Window(content=FormattedTextControl(body_text)),
+        buttons=dialog_buttons,
+        modal=True,
+    )
+
+    layout = Layout(dialog)
+
+    app = Application(
+        layout=layout,
+        key_bindings=key_bindings,
+        full_screen=True,
+        mouse_support=True,
+    )
+
+    return await app.run_async()
 
 
 async def _handle_quit_action(app, monitor_sock):
