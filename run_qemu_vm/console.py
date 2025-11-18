@@ -379,7 +379,7 @@ def _process_pty_data(data, app, pyte_stream, acs_translator, menu_is_active):
 class PTYReader:
     """
     Manages reading from a PTY file descriptor using asyncio's add_reader mechanism.
-    
+
     This class uses a callback-based approach with loop.add_reader() instead of
     run_in_executor() to avoid mixing threading with async I/O, which can cause
     event loop state issues.
@@ -399,23 +399,23 @@ class PTYReader:
     def _read_callback(self):
         """
         Callback invoked by the event loop when the PTY has data available.
-        
+
         This runs synchronously in the event loop thread, so it must not block.
         """
         try:
             # Read available data (non-blocking since PTY is O_NONBLOCK)
             data = os.read(self.pty_fd, 4096)
-            
+
             if not data:
                 # PTY closed
                 self._unregister_reader()
                 # Schedule app exit in the event loop
                 self.loop.call_soon_threadsafe(self.app.exit, "PTY closed")
                 return
-            
+
             # Process the data
             _process_pty_data(data, self.app, self.pyte_stream, self.acs_translator, self.menu_is_active)
-            
+
         except BlockingIOError:
             # No data available right now (shouldn't happen since we were notified, but handle it)
             pass
@@ -452,7 +452,7 @@ class PTYReader:
         self.loop = asyncio.get_running_loop()
         self.loop.add_reader(self.pty_fd, self._read_callback)
         self.reader_registered = True
-        
+
         # Wait until stop is signaled
         await self.stop_event.wait()
 
@@ -465,7 +465,7 @@ class PTYReader:
 async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, acs_translator, menu_is_active):
     """
     Reads data from the PTY using asyncio's add_reader mechanism.
-    
+
     This function creates a PTYReader instance and starts it, which registers
     a callback with the event loop to be invoked whenever the PTY has data available.
     """
@@ -557,6 +557,63 @@ def _initialize_console_state():
     return log_queue, log_buffer, current_mode, menu_is_active, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream, acs_translator
 
 
+def _fix_termios_state():
+    """
+    Fixes corrupted termios state on stdin before prompt_toolkit starts.
+
+    This addresses a bug where termios.tcgetattr() returns a cc (control characters)
+    array containing bytes objects instead of integers, which causes prompt_toolkit
+    to misinterpret control character mappings and consume the first keystroke
+    during error recovery.
+
+    This function:
+    1. Reads the current terminal attributes
+    2. Ensures the cc array contains proper integers
+    3. Sets the corrected attributes back to stdin
+    """
+    try:
+        # Get current terminal attributes
+        attrs = termios.tcgetattr(sys.stdin.fileno())
+
+        # attrs is a list: [iflag, oflag, cflag, lflag, ispeed, ospeed, cc]
+        # The cc (control characters) array is at index 6
+        cc = attrs[6]
+
+        # Check if cc contains bytes objects instead of integers
+        needs_fix = False
+        fixed_cc = []
+
+        for item in cc:
+            if isinstance(item, bytes):
+                # Convert bytes to integer (take first byte if non-empty, else 0)
+                fixed_value = item[0] if len(item) > 0 else 0
+                fixed_cc.append(fixed_value)
+                needs_fix = True
+            elif isinstance(item, int):
+                # Already an integer, keep as-is
+                fixed_cc.append(item)
+            else:
+                # Unexpected type, convert to int if possible
+                try:
+                    fixed_cc.append(int(item))
+                    needs_fix = True
+                except (ValueError, TypeError):
+                    # If conversion fails, use 0 as a safe default
+                    fixed_cc.append(0)
+                    needs_fix = True
+
+        # If we found and fixed corrupted data, apply the corrected attributes
+        if needs_fix:
+            attrs[6] = fixed_cc
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attrs)
+            print("Fixed corrupted terminal state (cc array contained bytes instead of integers)", file=sys.stderr)
+
+    except Exception as e:
+        # If we can't fix the terminal state, log the error but continue
+        # The application might still work, or the first keystroke issue might occur
+        print(f"Warning: Could not fix terminal state: {e}", file=sys.stderr)
+
+
 def _setup_console_app(
     current_mode, pty_fd, monitor_sock, log_buffer, pyte_screen, monitor_pyte_screen, menu_is_active
 ):
@@ -636,6 +693,10 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         return 1
 
     monitor_sock = await _connect_to_monitor(monitor_socket_path)
+
+    # Fix any corrupted termios state before starting prompt_toolkit
+    # This prevents the first keystroke from being consumed during error recovery
+    _fix_termios_state()
 
     app = _setup_console_app(
         current_mode, pty_fd, monitor_sock, log_buffer, pyte_screen, monitor_pyte_screen, menu_is_active
