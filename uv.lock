@@ -21,6 +21,15 @@ wheels = [
 ]
 
 [[package]]
+name = "manhole"
+version = "1.8.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d1/5c/2d1cd4957237b4c46aa8cac77e81780bf4439035a7f83b0a620a0de21bbc/manhole-1.8.1.tar.gz", hash = "sha256:3668fdaf83b33c943db4e750e0c554e31c20f63338496895dd4d6410680d9c4b", size = 41058 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/27/4f/70f87a63cc40f8f52ba5549c77f7f9e82a38e35d70f0b46a157eb5cabba8/manhole-1.8.1-py3-none-any.whl", hash = "sha256:35e4d051776fa375beb8a512994627a297ee16ee43618e8d4b9c486fe85b1729", size = 16347 },
+]
+
+[[package]]
 name = "packaging"
 version = "25.0"
 source = { registry = "https://pypi.org/simple" }
@@ -98,6 +107,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "manhole" },
     { name = "pytest" },
 ]
 
@@ -108,7 +118,10 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.0.1" }]
+dev = [
+    { name = "manhole", specifier = ">=1.8.1" },
+    { name = "pytest", specifier = ">=9.0.1" },
+]
 
 [[package]]
 name = "wcwidth"
