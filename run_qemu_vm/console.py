@@ -152,18 +152,11 @@ def _append_to_log(log_buffer: Buffer, text_to_append: str):
 
 
 def _open_pty_device(pty_device):
-    """Opens the PTY device file descriptor and sets it to raw mode."""
+    """Opens the PTY device file descriptor and sets it to non-blocking mode."""
     try:
-        pty_fd = os.open(pty_device, os.O_RDWR | os.O_NOCTTY)
+        pty_fd = os.open(pty_device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     except FileNotFoundError:
         print(f"Error: PTY device '{pty_device}' not found.", file=sys.stderr)
-        raise
-
-    try:
-        tty.setraw(pty_fd)
-    except termios.error as e:
-        print(f"Error setting raw mode on PTY device '{pty_device}': {e}", file=sys.stderr)
-        os.close(pty_fd)
         raise
 
     return pty_fd
@@ -383,34 +376,104 @@ def _process_pty_data(data, app, pyte_stream, acs_translator, menu_is_active):
         app.invalidate()
 
 
-async def _handle_pty_read_error(e, log_queue):
-    """Handles exceptions during PTY read operations."""
-    # Gracefully handle expected I/O error on shutdown when QEMU quits.
-    if isinstance(e, OSError) and e.errno == 5:
-        return True  # Indicates loop should break
+class PTYReader:
+    """
+    Manages reading from a PTY file descriptor using asyncio's add_reader mechanism.
+    
+    This class uses a callback-based approach with loop.add_reader() instead of
+    run_in_executor() to avoid mixing threading with async I/O, which can cause
+    event loop state issues.
+    """
 
-    # For any other exception, log it as a crash.
-    await _log_task_error(log_queue, "PTY READER", "CRASHED")
-    # Don't exit, allow monitor to be used for diagnostics.
-    return False  # Indicates function should return
+    def __init__(self, app, pty_fd, pyte_stream, log_queue, acs_translator, menu_is_active):
+        self.app = app
+        self.pty_fd = pty_fd
+        self.pyte_stream = pyte_stream
+        self.log_queue = log_queue
+        self.acs_translator = acs_translator
+        self.menu_is_active = menu_is_active
+        self.loop = None
+        self.reader_registered = False
+        self.stop_event = asyncio.Event()
+
+    def _read_callback(self):
+        """
+        Callback invoked by the event loop when the PTY has data available.
+        
+        This runs synchronously in the event loop thread, so it must not block.
+        """
+        try:
+            # Read available data (non-blocking since PTY is O_NONBLOCK)
+            data = os.read(self.pty_fd, 4096)
+            
+            if not data:
+                # PTY closed
+                self._unregister_reader()
+                # Schedule app exit in the event loop
+                self.loop.call_soon_threadsafe(self.app.exit, "PTY closed")
+                return
+            
+            # Process the data
+            _process_pty_data(data, self.app, self.pyte_stream, self.acs_translator, self.menu_is_active)
+            
+        except BlockingIOError:
+            # No data available right now (shouldn't happen since we were notified, but handle it)
+            pass
+        except OSError as e:
+            # Handle expected I/O error on shutdown when QEMU quits (errno 5 = EIO)
+            if e.errno == 5:
+                self._unregister_reader()
+                self.stop_event.set()
+            else:
+                # Log unexpected errors
+                self._unregister_reader()
+                # Schedule error logging
+                asyncio.create_task(self._log_error(e))
+        except Exception as e:
+            # Catch any other exceptions to prevent them from crashing the event loop
+            self._unregister_reader()
+            asyncio.create_task(self._log_error(e))
+
+    def _unregister_reader(self):
+        """Removes the reader callback from the event loop."""
+        if self.reader_registered and self.loop:
+            try:
+                self.loop.remove_reader(self.pty_fd)
+                self.reader_registered = False
+            except Exception:
+                pass  # Ignore errors during cleanup
+
+    async def _log_error(self, exception):
+        """Logs an exception that occurred during PTY reading."""
+        await _log_task_error(self.log_queue, "PTY READER", "CRASHED")
+
+    async def start(self):
+        """Registers the PTY file descriptor with the event loop for reading."""
+        self.loop = asyncio.get_running_loop()
+        self.loop.add_reader(self.pty_fd, self._read_callback)
+        self.reader_registered = True
+        
+        # Wait until stop is signaled
+        await self.stop_event.wait()
+
+    def stop(self):
+        """Stops reading from the PTY and unregisters the reader."""
+        self._unregister_reader()
+        self.stop_event.set()
 
 
 async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, acs_translator, menu_is_active):
-    """Reads data from the PTY, feeds it to the terminal emulator, and invalidates the app."""
-    loop = asyncio.get_running_loop()
-    while True:
-        try:
-            data = await loop.run_in_executor(None, os.read, pty_fd, 4096)
-            if not data:
-                app.exit(result="PTY closed")
-                return
-            _process_pty_data(data, app, pyte_stream, acs_translator, menu_is_active)
-        except Exception as e:
-            should_break = await _handle_pty_read_error(e, log_queue)
-            if should_break:
-                break
-            else:
-                return
+    """
+    Reads data from the PTY using asyncio's add_reader mechanism.
+    
+    This function creates a PTYReader instance and starts it, which registers
+    a callback with the event loop to be invoked whenever the PTY has data available.
+    """
+    reader = PTYReader(app, pty_fd, pyte_stream, log_queue, acs_translator, menu_is_active)
+    try:
+        await reader.start()
+    finally:
+        reader.stop()
 
 
 def _process_monitor_data(data, app, monitor_pyte_stream, menu_is_active):
