@@ -5,7 +5,6 @@ import subprocess
 import sys
 import termios
 import traceback
-import tty
 from asyncio import Queue
 
 import pyte
@@ -560,29 +559,26 @@ def _initialize_console_state():
 def _fix_termios_state():
     """
     Fixes corrupted termios state on stdin before prompt_toolkit starts.
+    Also hardens the state by disabling flow control and extended input processing.
 
-    This addresses a bug where termios.tcgetattr() returns a cc (control characters)
-    array containing bytes objects instead of integers, which causes prompt_toolkit
-    to misinterpret control character mappings and consume the first keystroke
-    during error recovery.
-
-    This function:
-    1. Reads the current terminal attributes
-    2. Ensures the cc array contains proper integers
-    3. Sets the corrected attributes back to stdin
+    This addresses:
+    1. A bug where termios.tcgetattr() returns bytes in the cc array.
+    2. Potential kernel-level consumption of keystrokes due to flow control (IXON/IXOFF)
+       or extended input processing (IEXTEN).
     """
     try:
         # Get current terminal attributes
         attrs = termios.tcgetattr(sys.stdin.fileno())
 
         # attrs is a list: [iflag, oflag, cflag, lflag, ispeed, ospeed, cc]
-        # The cc (control characters) array is at index 6
+        iflag = attrs[0]
+        lflag = attrs[3]
         cc = attrs[6]
 
-        # Check if cc contains bytes objects instead of integers
         needs_fix = False
-        fixed_cc = []
 
+        # 1. Fix corrupted CC array (bytes instead of ints)
+        fixed_cc = []
         for item in cc:
             if isinstance(item, bytes):
                 # Convert bytes to integer (take first byte if non-empty, else 0)
@@ -602,16 +598,30 @@ def _fix_termios_state():
                     fixed_cc.append(0)
                     needs_fix = True
 
-        # If we found and fixed corrupted data, apply the corrected attributes
         if needs_fix:
-            attrs[6] = fixed_cc
+             attrs[6] = fixed_cc
+             print("Fixed corrupted terminal state (cc array contained bytes instead of integers)", file=sys.stderr)
+
+        # 2. Harden Termios: Disable Flow Control and Extended Input
+        # IXON/IXOFF (Software Flow Control) can cause the kernel to consume Ctrl-S/Ctrl-Q
+        # IEXTEN (Extended Input) enables VLNEXT (Ctrl-V) and others
+        # We disable these to ensure raw input reaches the application.
+        new_iflag = iflag & ~(termios.IXON | termios.IXOFF)
+        new_lflag = lflag & ~termios.IEXTEN
+
+        if new_iflag != iflag or new_lflag != lflag:
+            attrs[0] = new_iflag
+            attrs[3] = new_lflag
+            needs_fix = True
+            print("Hardening termios: Disabled IXON, IXOFF, IEXTEN", file=sys.stderr)
+
+        # Apply changes if needed
+        if needs_fix:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attrs)
-            print("Fixed corrupted terminal state (cc array contained bytes instead of integers)", file=sys.stderr)
 
     except Exception as e:
         # If we can't fix the terminal state, log the error but continue
-        # The application might still work, or the first keystroke issue might occur
-        print(f"Warning: Could not fix terminal state: {e}", file=sys.stderr)
+        print(f"Warning: Could not fix/harden terminal state: {e}", file=sys.stderr)
 
 
 def _setup_console_app(
@@ -629,7 +639,12 @@ def _setup_console_app(
 
     key_bindings = _create_key_bindings(current_mode, pty_fd, monitor_sock, menu_is_active)
     layout = _create_console_layout(get_pty_screen_fragments, get_monitor_screen_fragments, current_mode)
-    app = Application(layout=layout, key_bindings=key_bindings, full_screen=True)
+
+    app = Application(
+        layout=layout,
+        key_bindings=key_bindings,
+        full_screen=True,
+    )
     return app
 
 

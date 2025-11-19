@@ -33,7 +33,7 @@ def run_qemu(args, config):
 
     try:
         if config.get('console') == 'text':
-            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             event, holder = threading.Event(), [None]
             thread = threading.Thread(target=parse_pty_device_from_thread, args=(process, event, holder))
             thread.daemon = True
