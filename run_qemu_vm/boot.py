@@ -509,15 +509,6 @@ def find_kernel_and_initrd(seven_zip_executable, iso_path):
     return None, None
 
 
-def _remove_cdrom_args(args):
-    """Removes -cdrom and its path from the argument list."""
-    args_copy = list(args)
-    if "-cdrom" in args_copy:
-        cdrom_index = args_copy.index("-cdrom")
-        args_copy.pop(cdrom_index)  # Remove '-cdrom'
-        args_copy.pop(cdrom_index)  # Remove path
-    return args_copy
-
 
 def _extract_kernel_and_initrd(config, kernel_file, initrd_file, temp_dir):
     """Extracts kernel and initrd from ISO to a temporary directory, exiting on failure."""
@@ -564,8 +555,17 @@ def add_direct_kernel_boot_args(base_args, config, kernel_file, initrd_file):
     Constructs QEMU arguments for direct kernel boot and executes QEMU.
     This function is a terminal operation; it will exit the script.
     """
-    args = _remove_cdrom_args(base_args)
+    args = list(base_args)  # Keep the original arguments including -cdrom
     kernel_cmd_line = _get_direct_boot_kernel_cmdline(config)
+
+    # Switch boot order to hard disk (c) so CD-ROM (d) is only used for bootstrapping
+    if any(arg.startswith('order=') for arg in args if isinstance(arg, str)):
+        for i, arg in enumerate(args):
+            if isinstance(arg, str) and arg.startswith('order='):
+                args[i] = 'order=c'  # Change boot order to hard disk
+                break
+    else:
+        args.extend(["-boot", "order=c"])
 
     if platform.system() == 'Linux':
         _run_direct_boot_linux(args, config, kernel_file, initrd_file, kernel_cmd_line)
