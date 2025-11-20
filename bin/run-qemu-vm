@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Wrapper script to run run-qemu-vm from symlinked locations.
+# Changes to project root, activates venv, and executes with arguments.
+
+set -euo pipefail
+
+# Resolve the real path of this script (handling symlinks)
+script_path=$(readlink -f "$0" 2>/dev/null || {
+    # Fallback for macOS BSD readlink
+    cd "$(dirname "$0")" >/dev/null 2>&1
+    printf "%s/%s" "$(pwd -P)" "$(basename "$0")"
+})
+
+# Get the project root directory (parent of bin/ directory)
+project_root=$(dirname "$(dirname "$script_path")")
+
+# Change to project root (only for the duration of this script)
+cd "$project_root" || {
+    echo >&2 "ERROR: Failed to change to project root: $project_root"
+    exit 1
+}
+
+# Verify required paths exist before proceeding
+[ ! -d ".venv" ] && {
+    echo >&2 "ERROR: Missing virtual environment at $project_root/.venv"
+    exit 1
+}
+
+[ ! -f "bin/run-qemu-vm.py" ] && {
+    echo >&2 "ERROR: Missing main script at $project_root/bin/run-qemu-vm.py"
+    exit 1
+}
+
+# Activate the virtual environment
+source .venv/bin/activate
+
+# Execute the Python script with all original arguments
+exec bin/run-qemu-vm.py "$@"
