@@ -5,6 +5,9 @@
 set -euo pipefail
 
 # Resolve the real path of this script (handling symlinks)
+# Preserve original working directory
+original_cwd="$(pwd -P)"
+
 script_path=$(readlink -f "$0" 2>/dev/null || {
     # Fallback for macOS BSD readlink
     cd "$(dirname "$0")" >/dev/null 2>&1
@@ -13,6 +16,27 @@ script_path=$(readlink -f "$0" 2>/dev/null || {
 
 # Get the project root directory (parent of bin/ directory)
 project_root=$(dirname "$(dirname "$script_path")")
+
+# Process arguments to convert relative paths to absolute based on original CWD
+processed_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --disk-image|--cdrom)
+            if [ -n "$2" ]; then
+                # Convert relative path to absolute based on original working directory
+                arg_path="$2"
+                if [ "${arg_path:0:1}" != "/" ]; then
+                    arg_path="${original_cwd}/${arg_path}"
+                fi
+                processed_args+=("$1" "$arg_path")
+                shift 2
+                continue
+            fi
+            ;;
+    esac
+    processed_args+=("$1")
+    shift
+done
 
 # Change to project root (only for the duration of this script)
 cd "$project_root" || {
@@ -34,5 +58,5 @@ cd "$project_root" || {
 # Activate the virtual environment
 source .venv/bin/activate
 
-# Execute the Python script with all original arguments
-exec bin/run-qemu-vm.py "$@"
+# Execute the Python script with processed arguments
+exec bin/run-qemu-vm.py "${processed_args[@]}"
