@@ -130,6 +130,8 @@ def main():
     parser.add_argument("--boot-from", choices=['cdrom', 'hd'], help="Specify boot device. Defaults to 'cdrom' if --cdrom is used.")
     parser.add_argument("--firmware", choices=['uefi', 'bios'], help="Force a specific firmware mode, overriding automatic selection.")
     parser.add_argument("--console", choices=['gui', 'text'], default='gui', help="Console type. Defaults to 'gui'.")
+    parser.add_argument("--attribute-log-to-file", help="Enable attribute-centric logging to the specified file.")
+    parser.add_argument("--debug-file", help="Enable comprehensive debug logging to the specified file.")
     parser.add_argument("--share-dir", metavar="/HOST/PATH:MOUNT_TAG", help="Share a host directory with the guest via VirtFS.")
     parser.add_argument("--serial-device", help="Serial device profile for text mode. Use 'list' to see options.")
 
@@ -152,6 +154,24 @@ def main():
 
     args = parser.parse_args()
     config = vars(args)
+
+    # Set the global config for the attribute log file path
+    if config.get("attribute_log_to_file"):
+        log_file_path = config["attribute_log_to_file"]
+        if os.path.exists(log_file_path):
+            print(f"Error: Attribute log file already exists: {log_file_path}", file=sys.stderr)
+            print("       Please specify a new file or remove the existing one.", file=sys.stderr)
+            sys.exit(1)
+        app_config.ATTRIBUTE_LOG_FILE = log_file_path
+
+    # Set the global config for the debug file path
+    if config.get("debug_file"):
+        debug_file_path = config["debug_file"]
+        if os.path.exists(debug_file_path):
+            print(f"Error: Debug file already exists: {debug_file_path}", file=sys.stderr)
+            print("       Please specify a new file or remove the existing one.", file=sys.stderr)
+            sys.exit(1)
+        app_config.DEBUG_FILE = debug_file_path
 
     # Expand user home directory in path arguments
     if config.get("disk_image"):

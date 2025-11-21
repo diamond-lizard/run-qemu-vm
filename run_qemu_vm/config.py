@@ -1,5 +1,11 @@
 # --- Global Configuration & Executable Paths ---
 
+# Path to the attribute log file, if enabled via command line.
+ATTRIBUTE_LOG_FILE = None
+
+# Path to the debug log file, if enabled via command line.
+DEBUG_FILE = None
+
 # List of supported QEMU architectures
 SUPPORTED_ARCHITECTURES = [
     "aarch64", "alpha", "arm", "avr", "hppa", "i386", "loongarch64", "m68k",

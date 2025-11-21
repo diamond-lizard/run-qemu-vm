@@ -3,12 +3,14 @@ import re
 import subprocess
 import sys
 import threading
+import time
 
 from . import console
 
 
-def parse_pty_device_from_thread(process, event, result_holder):
+def parse_pty_device_from_thread(process, event, result_holder, debug_info):
     """Reads from process output in a thread, finds PTY device, and drains output."""
+    debug_info['thread_start'] = time.time()
     pty_device_found = False
     for line in iter(process.stdout.readline, ''):
         sys.stdout.write(line)
@@ -17,6 +19,7 @@ def parse_pty_device_from_thread(process, event, result_holder):
             match = re.search(r'char device redirected to (/dev/[^\s]+)', line)
             if match:
                 result_holder[0] = match.group(1)
+                debug_info['pty_found'] = time.time()
                 print(f"Info: Found serial console device: {result_holder[0]}", flush=True)
                 pty_device_found = True
                 event.set()
@@ -33,9 +36,10 @@ def run_qemu(args, config):
 
     try:
         if config.get('console') == 'text':
+            debug_info = {'qemu_start': time.time()}
             process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             event, holder = threading.Event(), [None]
-            thread = threading.Thread(target=parse_pty_device_from_thread, args=(process, event, holder))
+            thread = threading.Thread(target=parse_pty_device_from_thread, args=(process, event, holder, debug_info))
             thread.daemon = True
             thread.start()
             if not event.wait(timeout=10.0) or not holder[0]:
@@ -44,9 +48,20 @@ def run_qemu(args, config):
                 thread.join()
                 sys.exit(1)
 
+            debug_info['pty_ready'] = time.time()
+            
+            # Log timing information
+            qemu_to_pty = debug_info['pty_found'] - debug_info['qemu_start']
+            print(f"Info: PTY device detected {qemu_to_pty:.3f}s after QEMU start", flush=True)
+            
+            # Give QEMU a moment to fully initialize the PTY connection
+            # This prevents the race condition where we open the PTY before QEMU connects
+            time.sleep(0.5)
+            debug_info['console_start'] = time.time()
+
             # Hand off to the prompt_toolkit console manager
             try:
-                return_code = asyncio.run(console.run_prompt_toolkit_console(process, holder[0], config['monitor_socket']))
+                return_code = asyncio.run(console.run_prompt_toolkit_console(process, holder[0], config['monitor_socket'], debug_info))
             except KeyboardInterrupt:
                 # This is a fallback; prompt_toolkit should handle Ctrl-C gracefully.
                 print("\nInterrupted by user.", flush=True)
