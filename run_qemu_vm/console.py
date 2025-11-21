@@ -566,6 +566,8 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_is_active, ra
     This approach uses `run_in_executor` to run the blocking `os.read` call in a
     separate thread, preventing it from blocking the main asyncio event loop. This
     is a robust pattern for integrating blocking I/O with asyncio.
+    
+    When the PTY is closed (QEMU exits), this function will exit the application.
     """
     _debug_log(debug_file, "PTY_READER: Starting read loop")
     
@@ -591,8 +593,10 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_is_active, ra
             read_count += 1
 
             if not data:
-                # PTY closed, exit the reading loop
-                _debug_log(debug_file, f"PTY_READER: PTY closed after {read_count} reads")
+                # PTY closed, QEMU has exited
+                _debug_log(debug_file, f"PTY_READER: PTY closed after {read_count} reads - QEMU has exited")
+                # Exit the application cleanly
+                app.exit(result="QEMU exited")
                 break
 
             _debug_log(debug_file, f"PTY_READER: Read #{read_count}: {len(data)} bytes in {read_duration:.6f}s")
@@ -615,10 +619,14 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_is_active, ra
         # This can happen if the PTY is closed while we are waiting to read,
         # for example, during a clean shutdown.
         _debug_log(debug_file, f"PTY_READER: OSError after {read_count} reads: {e}")
+        # Exit the application on error as well
+        app.exit(result="PTY error")
     except Exception as e:
         # Log any other unexpected errors and exit the loop
         _debug_log(debug_file, f"PTY_READER: Unexpected error after {read_count} reads: {e}")
         await _log_task_error(log_queue, "PTY READER", "CRASHED")
+        # Exit the application
+        app.exit(result="PTY reader crashed")
 
 
 def _process_monitor_data(data, app, monitor_pyte_stream, menu_is_active, debug_file=None):
