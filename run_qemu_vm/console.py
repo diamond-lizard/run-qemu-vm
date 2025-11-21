@@ -1,6 +1,9 @@
 import asyncio
+import fcntl
 import os
+import shutil
 import socket
+import struct
 import subprocess
 import sys
 import termios
@@ -25,7 +28,6 @@ from prompt_toolkit.layout.processors import (
 from prompt_toolkit.widgets import Button, Dialog
 
 from . import config as app_config
-from .acs_translator import ACSTranslator
 
 
 class AnsiColorProcessor(Processor):
@@ -159,6 +161,22 @@ def _open_pty_device(pty_device):
         raise
 
     return pty_fd
+
+
+def _set_pty_size(pty_fd, rows, cols):
+    """
+    Sets the window size of the PTY using ioctl TIOCSWINSZ.
+    This informs the guest OS of the correct terminal dimensions.
+    """
+    if pty_fd < 0:
+        return
+    try:
+        # struct winsize { unsigned short ws_row; unsigned short ws_col; ... }
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(pty_fd, termios.TIOCSWINSZ, winsize)
+    except OSError:
+        # Ignore errors if the PTY is closed or invalid
+        pass
 
 
 async def _connect_to_monitor(monitor_socket_path):
@@ -365,12 +383,11 @@ async def _log_task_error(log_queue: Queue, task_name: str, error_type: str = "E
     await log_queue.put(f"\n--- {task_name} {error_type} ---\n{tb_str}")
 
 
-def _process_pty_data(data, app, pyte_stream, acs_translator, menu_is_active):
-    """Translates ACS sequences, feeds PTY data to the stream, and invalidates the app."""
-    # First, translate any DEC Special Graphics (ACS) sequences to Unicode.
-    translated_data = acs_translator.translate(data)
-    # Then, decode the (potentially modified) data and feed it to pyte.
-    pyte_stream.feed(translated_data.decode("utf-8", "replace"))
+def _process_pty_data(data, app, pyte_stream, menu_is_active):
+    """Feeds PTY data to the stream and invalidates the app."""
+    # We feed the raw data directly to pyte. pyte handles UTF-8 and
+    # DEC Special Graphics (ACS) sequences natively.
+    pyte_stream.feed(data.decode("utf-8", "replace"))
     if not menu_is_active[0]:
         app.invalidate()
 
@@ -384,12 +401,11 @@ class PTYReader:
     event loop state issues.
     """
 
-    def __init__(self, app, pty_fd, pyte_stream, log_queue, acs_translator, menu_is_active):
+    def __init__(self, app, pty_fd, pyte_stream, log_queue, menu_is_active):
         self.app = app
         self.pty_fd = pty_fd
         self.pyte_stream = pyte_stream
         self.log_queue = log_queue
-        self.acs_translator = acs_translator
         self.menu_is_active = menu_is_active
         self.loop = None
         self.reader_registered = False
@@ -413,7 +429,7 @@ class PTYReader:
                 return
 
             # Process the data
-            _process_pty_data(data, self.app, self.pyte_stream, self.acs_translator, self.menu_is_active)
+            _process_pty_data(data, self.app, self.pyte_stream, self.menu_is_active)
 
         except BlockingIOError:
             # No data available right now (shouldn't happen since we were notified, but handle it)
@@ -461,14 +477,14 @@ class PTYReader:
         self.stop_event.set()
 
 
-async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, acs_translator, menu_is_active):
+async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_is_active):
     """
     Reads data from the PTY using asyncio's add_reader mechanism.
 
     This function creates a PTYReader instance and starts it, which registers
     a callback with the event loop to be invoked whenever the PTY has data available.
     """
-    reader = PTYReader(app, pty_fd, pyte_stream, log_queue, acs_translator, menu_is_active)
+    reader = PTYReader(app, pty_fd, pyte_stream, log_queue, menu_is_active)
     try:
         await reader.start()
     finally:
@@ -548,12 +564,16 @@ def _initialize_console_state():
         app_config.MODE_SERIAL_CONSOLE
     ]  # List to be mutable from closures
     menu_is_active = [False]  # List to be mutable from closures
-    pyte_screen = pyte.Screen(80, 24)
+
+    # Detect the actual terminal size, defaulting to 80x24 if detection fails.
+    cols, rows = shutil.get_terminal_size(fallback=(80, 24))
+
+    pyte_screen = pyte.Screen(cols, rows)
     pyte_stream = pyte.Stream(pyte_screen)
-    monitor_pyte_screen = pyte.Screen(80, 24)
+    monitor_pyte_screen = pyte.Screen(cols, rows)
     monitor_pyte_stream = pyte.Stream(monitor_pyte_screen)
-    acs_translator = ACSTranslator()
-    return log_queue, log_buffer, current_mode, menu_is_active, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream, acs_translator
+
+    return log_queue, log_buffer, current_mode, menu_is_active, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream
 
 
 def _fix_termios_state():
@@ -630,11 +650,27 @@ def _setup_console_app(
     """Creates and configures the prompt_toolkit Application."""
 
     def get_pty_screen_fragments():
-        """Wrapper to pass pyte_screen to the fragment generator."""
+        """
+        Wrapper to pass pyte_screen to the fragment generator.
+        Also checks for terminal resizing and updates pyte/PTY accordingly.
+        """
+        # Check if the host terminal size has changed
+        cols, rows = shutil.get_terminal_size()
+        if pyte_screen.columns != cols or pyte_screen.lines != rows:
+            # Resize the pyte screen to match the host
+            pyte_screen.resize(lines=rows, columns=cols)
+            # Inform the guest OS of the new size via ioctl
+            _set_pty_size(pty_fd, rows, cols)
+
         return _get_pty_screen_fragments(pyte_screen)
 
     def get_monitor_screen_fragments():
         """Wrapper to pass monitor_pyte_screen to the fragment generator."""
+        # We also resize the monitor screen for consistency, though it's less critical
+        cols, rows = shutil.get_terminal_size()
+        if monitor_pyte_screen.columns != cols or monitor_pyte_screen.lines != rows:
+            monitor_pyte_screen.resize(lines=rows, columns=cols)
+
         return _get_pty_screen_fragments(monitor_pyte_screen)
 
     key_bindings = _create_key_bindings(current_mode, pty_fd, monitor_sock, menu_is_active)
@@ -648,10 +684,10 @@ def _setup_console_app(
     return app
 
 
-def _create_async_tasks(app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, acs_translator, menu_is_active):
+def _create_async_tasks(app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, menu_is_active):
     """Creates and returns all background asyncio tasks."""
     pty_reader_task = asyncio.create_task(
-        _read_from_pty(app, pty_fd, pyte_stream, log_queue, acs_translator, menu_is_active)
+        _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_is_active)
     )
     monitor_reader_task = asyncio.create_task(
         _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue, menu_is_active)
@@ -699,13 +735,16 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         pyte_stream,
         monitor_pyte_screen,
         monitor_pyte_stream,
-        acs_translator,
     ) = _initialize_console_state()
 
     try:
         pty_fd = _open_pty_device(pty_device)
     except FileNotFoundError:
         return 1
+
+    # Set the initial PTY size to match the current terminal size.
+    # This ensures the guest OS (e.g., GRUB, Linux) formats its output correctly from boot.
+    _set_pty_size(pty_fd, pyte_screen.lines, pyte_screen.columns)
 
     monitor_sock = await _connect_to_monitor(monitor_socket_path)
 
@@ -718,7 +757,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
     )
 
     tasks = _create_async_tasks(
-        app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, acs_translator, menu_is_active
+        app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, menu_is_active
     )
 
     return await _manage_console_session(
