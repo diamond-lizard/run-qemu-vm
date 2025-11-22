@@ -21,7 +21,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, Window
+from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, VSplit, Window, FloatContainer, Float
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.processors import (
@@ -29,7 +29,7 @@ from prompt_toolkit.layout.processors import (
     Transformation,
     TransformationInput,
 )
-from prompt_toolkit.widgets import Button, Dialog
+from prompt_toolkit.styles import Style
 
 from . import config as app_config
 
@@ -146,7 +146,7 @@ def _process_line_to_fragments(y, pyte_screen):
 def _get_pty_screen_fragments(pyte_screen, attr_log_file=None, debug_file=None):
     """Converts the entire pyte screen state into prompt_toolkit fragments."""
     _debug_log(debug_file, f"RENDER: Starting fragment generation. Cursor at ({pyte_screen.cursor.x}, {pyte_screen.cursor.y})")
-    
+
     render_start = time.time()
     fragments = []
     if attr_log_file:
@@ -155,7 +155,7 @@ def _get_pty_screen_fragments(pyte_screen, attr_log_file=None, debug_file=None):
 
     non_empty_lines = 0
     total_fragments = 0
-    
+
     # Process ALL lines without optimization - we need to see what's actually there
     for y in range(pyte_screen.lines):
         line_fragments = _process_line_to_fragments(y, pyte_screen)
@@ -178,7 +178,7 @@ def _get_pty_screen_fragments(pyte_screen, attr_log_file=None, debug_file=None):
 
     render_duration = time.time() - render_start
     _debug_log(debug_file, f"RENDER: Generated {total_fragments} fragments from {non_empty_lines} non-empty lines in {render_duration:.6f}s")
-    
+
     # Debug: Log the actual pyte screen state
     if debug_file:
         _debug_log(debug_file, f"PYTE_STATE: Screen size {pyte_screen.lines}x{pyte_screen.columns}")
@@ -187,7 +187,7 @@ def _get_pty_screen_fragments(pyte_screen, attr_log_file=None, debug_file=None):
         for i, line in enumerate(pyte_screen.display[:10]):  # First 10 lines
             if line.strip():
                 _debug_log(debug_file, f"PYTE_STATE: Display[{i}] = {repr(line)}")
-    
+
     return fragments
 
 
@@ -246,77 +246,103 @@ async def _connect_to_monitor(monitor_socket_path, debug_file=None):
         return None
 
 
-async def _show_control_menu():
+class ControlMenuState:
+    """Holds the state for the control menu dialog."""
+    def __init__(self):
+        self.is_visible = False
+        self.result = None
+
+
+def _create_custom_control_menu(state, current_mode, monitor_sock, debug_file=None):
     """
-    Displays a custom control menu with single-key shortcuts.
+    Creates a custom control menu dialog using basic prompt_toolkit containers.
 
-    This dialog allows the user to select an action using either mouse clicks,
-    arrow keys + Enter, or single-character shortcuts (R, E, Q).
+    This builds the dialog manually using Window, HSplit, and VSplit
+    instead of relying on the Dialog widget or Frame, which may not be available
+    or don't work properly in a Float container.
     """
-    # This variable will hold the Application instance. The button handlers
-    # close over it to be able to exit the dialog.
-    app = None
 
-    buttons_with_shortcuts = [
-        ("(R)esume Console", "resume", "r"),
-        ("(E)nter Monitor", "monitor", "e"),
-        ("(Q)uit QEMU", "quit", "q"),
-    ]
-
-    def create_handler(value):
-        """Creates a button handler that exits the app with a given result."""
-
-        def handler():
-            if app:
-                app.exit(result=value)
-
-        return handler
-
-    # Calculate the width needed for buttons.
-    # Find the longest button text and add padding for button decorations.
-    # Buttons typically need extra space for borders, padding, and focus indicators.
-    max_button_text_length = max(len(text) for text, _, _ in buttons_with_shortcuts)
-    # Add 4 characters for button padding/borders (2 on each side is typical)
-    button_width = max_button_text_length + 4
-
-    dialog_buttons = [
-        Button(text=text, handler=create_handler(value), width=button_width)
-        for text, value, _ in buttons_with_shortcuts
-    ]
-
-    key_bindings = KeyBindings()
-    for _, value, key in buttons_with_shortcuts:
-        # Use a lambda with a default argument to capture the value of `value`
-        # for each key binding.
-        key_bindings.add(key.lower(), eager=True)(
-            lambda event, v=value: event.app.exit(result=v)
-        )
-        key_bindings.add(key.upper(), eager=True)(
-            lambda event, v=value: event.app.exit(result=v)
-        )
-
-    # Create a body text that is at least as wide as the buttons to ensure
-    # the dialog allocates sufficient width. We pad the text to match the
-    # button width to give the layout engine a hint about minimum width.
-    body_text = "Select an action:".ljust(button_width)
-
-    dialog = Dialog(
-        title="Control Menu",
-        body=Window(content=FormattedTextControl(body_text)),
-        buttons=dialog_buttons,
-        modal=True,
+    # Title bar
+    title_text = "╔══ Control Menu ══╗"
+    title_window = Window(
+        content=FormattedTextControl(text=title_text),
+        height=1,
+        dont_extend_height=True,
+        style="class:dialog.title",
     )
 
-    layout = Layout(dialog)
-
-    app = Application(
-        layout=layout,
-        key_bindings=key_bindings,
-        full_screen=True,
-        mouse_support=True,
+    # Menu body text
+    body_text = "│ Select an action: │"
+    body_window = Window(
+        content=FormattedTextControl(text=body_text),
+        height=1,
+        dont_extend_height=True,
+        style="class:dialog.body",
     )
 
-    return await app.run_async()
+    # Separator
+    separator_text = "├────────────────────┤"
+    separator_window = Window(
+        content=FormattedTextControl(text=separator_text),
+        height=1,
+        dont_extend_height=True,
+        style="class:dialog.body",
+    )
+
+    # Create button text with visual indicators
+    def get_button_text(label, key):
+        """Returns formatted text for a button."""
+        return f"│ ({key}) {label:<15} │"
+
+    resume_text = get_button_text("Resume Console", "R")
+    monitor_text = get_button_text("Enter Monitor", "E")
+    quit_text = get_button_text("Quit QEMU", "Q")
+
+    # Create button windows
+    resume_button = Window(
+        content=FormattedTextControl(text=resume_text),
+        height=1,
+        dont_extend_height=True,
+        style="class:dialog.button",
+    )
+
+    monitor_button = Window(
+        content=FormattedTextControl(text=monitor_text),
+        height=1,
+        dont_extend_height=True,
+        style="class:dialog.button",
+    )
+
+    quit_button = Window(
+        content=FormattedTextControl(text=quit_text),
+        height=1,
+        dont_extend_height=True,
+        style="class:dialog.button",
+    )
+
+    # Bottom border
+    bottom_text = "╚════════════════════╝"
+    bottom_window = Window(
+        content=FormattedTextControl(text=bottom_text),
+        height=1,
+        dont_extend_height=True,
+        style="class:dialog.body",
+    )
+
+    # Combine all parts vertically
+    dialog_content = HSplit(
+        [
+            title_window,
+            body_window,
+            separator_window,
+            resume_button,
+            monitor_button,
+            quit_button,
+            bottom_window,
+        ]
+    )
+
+    return dialog_content
 
 
 async def _handle_quit_action(app, monitor_sock, debug_file=None):
@@ -362,10 +388,11 @@ async def _handle_resume_action(app, current_mode, debug_file=None):
     app.invalidate()
 
 
-async def _process_control_menu_choice(
+async def _process_control_menu_result(
     result, app, current_mode, monitor_sock, debug_file=None
 ):
     """Handles the action selected from the control menu."""
+    _debug_log(debug_file, f"MENU: Processing menu result: {result}")
     if result == "quit":
         await _handle_quit_action(app, monitor_sock, debug_file)
     elif result == "monitor":
@@ -374,27 +401,34 @@ async def _process_control_menu_choice(
         await _handle_resume_action(app, current_mode, debug_file)
 
 
-async def _handle_control_menu(
-    app, current_mode, monitor_sock, menu_is_active, debug_file=None
-):
-    """Displays the control menu and handles the user's choice."""
-    _debug_log(debug_file, "MENU: Opening control menu")
-    menu_is_active[0] = True
+def _show_control_menu(app, menu_state, current_mode, monitor_sock, main_content_container, debug_file=None):
+    """Shows the control menu dialog."""
+    _debug_log(debug_file, f"MENU: Showing control menu (app id: {id(app)})")
+    menu_state.is_visible = True
+    menu_state.result = None
+    app.invalidate()
+    _debug_log(debug_file, "MENU: Control menu shown and invalidated")
+
+
+def _hide_control_menu(app, menu_state, main_content_container, debug_file=None):
+    """Hides the control menu dialog and returns focus to main content."""
+    _debug_log(debug_file, "MENU: Hiding control menu")
+    menu_state.is_visible = False
+
+    # Return focus to the main content
     try:
-        result = await _show_control_menu()
-        await _process_control_menu_choice(
-            result, app, current_mode, monitor_sock, debug_file
-        )
-    finally:
-        menu_is_active[0] = False
+        app.layout.focus(main_content_container)
         app.invalidate()
+        _debug_log(debug_file, "MENU: Control menu hidden, focus returned to main content")
+    except Exception as e:
+        _debug_log(debug_file, f"MENU: Error hiding menu: {e}")
 
 
 async def _forward_input(event, current_mode, pty_fd, monitor_sock, debug_file=None):
     """Forwards user input to the PTY or monitor based on the current mode."""
     data_repr = repr(event.data)
     _debug_log(debug_file, f"INPUT: Forwarding {data_repr} in mode {current_mode[0]}")
-    
+
     loop = asyncio.get_running_loop()
     try:
         if current_mode[0] == app_config.MODE_SERIAL_CONSOLE:
@@ -411,33 +445,52 @@ async def _forward_input(event, current_mode, pty_fd, monitor_sock, debug_file=N
         _debug_log(debug_file, f"INPUT: Write error: {e}")
 
 
-def _create_key_bindings(current_mode, pty_fd, monitor_sock, menu_is_active, debug_file=None):
+def _create_key_bindings(current_mode, pty_fd, monitor_sock, menu_state, main_content_container, debug_file=None):
     """Creates and configures the key bindings for the console application."""
     key_bindings = KeyBindings()
 
-    # Eagerly bind Ctrl-] to open the control menu.
-    # This must be eager to preempt prompt_toolkit's default behavior for some
-    # control characters and the <any> fallback.
-    # Use 'c-]' which is the correct symbolic notation for Ctrl-] in prompt_toolkit.
-    @key_bindings.add("c-]", eager=True)  # Ctrl-]
-    async def _(event):
-        await _handle_control_menu(
-            event.app, current_mode, monitor_sock, menu_is_active, debug_file
-        )
+    # Create a condition for when the menu is NOT active
+    menu_not_active = Condition(lambda: not menu_state.is_visible)
+    menu_is_active = Condition(lambda: menu_state.is_visible)
 
-    # Eagerly bind Ctrl-C to forward it to the guest.
-    # This is critical to prevent prompt_toolkit from raising KeyboardInterrupt
-    # and terminating the application.
-    @key_bindings.add("c-c", eager=True)
-    async def _(event):
+    # Eagerly bind Ctrl-] to open the control menu (only when menu is not already active)
+    @key_bindings.add("c-]", eager=True, filter=menu_not_active)
+    def show_menu(event):
+        _debug_log(debug_file, f"KEYBIND: Ctrl-] pressed (app id: {id(event.app)})")
+        _show_control_menu(event.app, menu_state, current_mode, monitor_sock, main_content_container, debug_file)
+
+    # Bind 'r' to resume when menu is active
+    @key_bindings.add("r", filter=menu_is_active, eager=True)
+    @key_bindings.add("R", filter=menu_is_active, eager=True)
+    def menu_resume(event):
+        _debug_log(debug_file, "KEYBIND: 'r' pressed in menu")
+        menu_state.result = "resume"
+        _hide_control_menu(event.app, menu_state, main_content_container, debug_file)
+
+    # Bind 'e' to enter monitor when menu is active
+    @key_bindings.add("e", filter=menu_is_active, eager=True)
+    @key_bindings.add("E", filter=menu_is_active, eager=True)
+    def menu_monitor(event):
+        _debug_log(debug_file, "KEYBIND: 'e' pressed in menu")
+        menu_state.result = "monitor"
+        _hide_control_menu(event.app, menu_state, main_content_container, debug_file)
+
+    # Bind 'q' to quit when menu is active
+    @key_bindings.add("q", filter=menu_is_active, eager=True)
+    @key_bindings.add("Q", filter=menu_is_active, eager=True)
+    def menu_quit(event):
+        _debug_log(debug_file, "KEYBIND: 'q' pressed in menu")
+        menu_state.result = "quit"
+        _hide_control_menu(event.app, menu_state, main_content_container, debug_file)
+
+    # Eagerly bind Ctrl-C to forward it to the guest (only when menu is not active)
+    @key_bindings.add("c-c", eager=True, filter=menu_not_active)
+    async def forward_ctrl_c(event):
         await _forward_input(event, current_mode, pty_fd, monitor_sock, debug_file)
 
-    # The <any> binding is a non-eager fallback. It will catch any key
-    # sequence that is not handled by a more specific (or eager) binding.
-    # This includes all printable characters (like 'e' for GRUB) and other
-    # unhandled control sequences.
-    @key_bindings.add("<any>")
-    async def _(event):
+    # The <any> binding is a non-eager fallback (only when menu is not active)
+    @key_bindings.add("<any>", filter=menu_not_active)
+    async def forward_any(event):
         await _forward_input(event, current_mode, pty_fd, monitor_sock, debug_file)
 
     return key_bindings
@@ -449,20 +502,28 @@ def _create_console_layout(
     current_mode,
     pyte_screen,
     monitor_pyte_screen,
+    menu_state,
+    debug_file=None,
 ):
-    """Creates the prompt_toolkit layout for the console."""
+    """Creates the prompt_toolkit layout for the console with integrated control menu."""
     is_serial_mode = Condition(lambda: current_mode[0] == app_config.MODE_SERIAL_CONSOLE)
+    is_menu_visible = Condition(lambda: menu_state.is_visible)
 
     def get_pty_cursor_position():
         """Gets the cursor position from the PTY pyte screen."""
-        # This function is called by prompt-toolkit without arguments.
-        # Clamp cursor position to valid screen bounds to prevent display issues
         x = max(0, min(pyte_screen.cursor.x, pyte_screen.columns - 1))
         y = max(0, min(pyte_screen.cursor.y, pyte_screen.lines - 1))
         return Point(x=x, y=y)
 
+    def get_pty_fragments_with_debug():
+        """Wrapper that logs when fragments are being generated for PTY."""
+        _debug_log(debug_file, f"LAYOUT: get_pty_screen_fragments called (mode={current_mode[0]}, menu_visible={menu_state.is_visible})")
+        result = get_pty_screen_fragments()
+        _debug_log(debug_file, f"LAYOUT: get_pty_screen_fragments returned {len(result)} fragments")
+        return result
+
     pty_control = FormattedTextControl(
-        text=get_pty_screen_fragments, get_cursor_position=get_pty_cursor_position
+        text=get_pty_fragments_with_debug, get_cursor_position=get_pty_cursor_position
     )
     pty_container = ConditionalContainer(
         Window(content=pty_control, dont_extend_height=True), filter=is_serial_mode
@@ -470,14 +531,19 @@ def _create_console_layout(
 
     def get_monitor_cursor_position():
         """Gets the cursor position from the monitor pyte screen."""
-        # This function is called by prompt-toolkit without arguments.
-        # Clamp cursor position to valid screen bounds to prevent display issues
         x = max(0, min(monitor_pyte_screen.cursor.x, monitor_pyte_screen.columns - 1))
         y = max(0, min(monitor_pyte_screen.cursor.y, monitor_pyte_screen.lines - 1))
         return Point(x=x, y=y)
 
+    def get_monitor_fragments_with_debug():
+        """Wrapper that logs when fragments are being generated for monitor."""
+        _debug_log(debug_file, f"LAYOUT: get_monitor_screen_fragments called (mode={current_mode[0]}, menu_visible={menu_state.is_visible})")
+        result = get_monitor_screen_fragments()
+        _debug_log(debug_file, f"LAYOUT: get_monitor_screen_fragments returned {len(result)} fragments")
+        return result
+
     monitor_control = FormattedTextControl(
-        text=get_monitor_screen_fragments,
+        text=get_monitor_fragments_with_debug,
         get_cursor_position=get_monitor_cursor_position,
     )
     monitor_container = ConditionalContainer(
@@ -485,7 +551,29 @@ def _create_console_layout(
         filter=~is_serial_mode,
     )
 
-    return Layout(HSplit([pty_container, monitor_container]))
+    # Main content container
+    main_content = HSplit([pty_container, monitor_container])
+
+    # Create the custom control menu dialog using basic containers
+    control_menu_dialog = _create_custom_control_menu(menu_state, current_mode, None, debug_file)
+
+    # Wrap the control menu in a ConditionalContainer to handle visibility
+    conditional_menu_dialog = ConditionalContainer(
+        content=control_menu_dialog,
+        filter=is_menu_visible,
+    )
+
+    # Wrap main content in a FloatContainer with the control menu as a float
+    root_container = FloatContainer(
+        content=main_content,
+        floats=[
+            Float(
+                content=conditional_menu_dialog,
+            )
+        ]
+    )
+
+    return Layout(root_container), main_content
 
 
 async def _log_task_error(log_queue: Queue, task_name: str, error_type: str = "ERROR"):
@@ -497,83 +585,79 @@ async def _log_task_error(log_queue: Queue, task_name: str, error_type: str = "E
 def _filter_cursor_position_queries(data):
     """
     Filters out cursor position query sequences (CPR) from the data stream.
-    
+
     These sequences (ESC[6n) are sometimes sent by the guest and can cause
     cursor position issues. We filter them out to prevent interference.
-    
+
     Returns: (filtered_data, had_cpr)
     """
-    # Pattern for cursor position query: ESC[6n
-    # Pattern for cursor position report: ESC[row;colR
-    # Pattern for extreme cursor movements: ESC[32766;32766H (or similar large numbers)
-    
     original_len = len(data)
-    
+
     # Remove cursor position queries (ESC[6n)
     filtered = data.replace(b'\x1b[6n', b'')
-    
+
     # Remove extreme cursor position movements (anything moving to row/col > 1000)
     # This is a heuristic to catch ESC[32766;32766H type sequences
     import re
     # Match ESC[<large_num>;<large_num>H where large_num > 1000
     filtered = re.sub(b'\x1b\\[(\\d{4,});(\\d{4,})H', b'', filtered)
-    
+
     had_cpr = len(filtered) != original_len
-    
+
     return filtered, had_cpr
 
 
-def _process_pty_data(data, app, pyte_stream, menu_is_active, debug_file=None):
+def _process_pty_data(data, app, pyte_stream, menu_state, debug_file=None):
     """
     Feeds PTY data to the pyte stream and triggers UI invalidation.
     """
     start_time = time.time()
-    _debug_log(debug_file, f"PTY_DATA: Processing {len(data)} bytes")
-    
+    _debug_log(debug_file, f"PTY_DATA: Processing {len(data)} bytes (menu_visible={menu_state.is_visible}, app id: {id(app)})")
+
     # Filter out cursor position queries before processing
     filtered_data, had_cpr = _filter_cursor_position_queries(data)
     if had_cpr:
         _debug_log(debug_file, f"PTY_DATA: Filtered cursor position queries/reports ({len(data)} -> {len(filtered_data)} bytes)")
-    
+
     if not filtered_data:
         _debug_log(debug_file, "PTY_DATA: All data was filtered out, skipping")
         return
-    
+
     decoded_data = filtered_data.decode("utf-8", "replace")
-    
+
     # Log a sample of the data for debugging
     sample = decoded_data[:100].replace('\n', '\\n').replace('\r', '\\r')
     _debug_log(debug_file, f"PTY_DATA: Sample: {repr(sample)}")
-    
-    # Feed ALL data at once to pyte - chunking was causing issues
+
+    # Feed ALL data at once to pyte
     feed_start = time.time()
     pyte_stream.feed(decoded_data)
     feed_duration = time.time() - feed_start
-    
+
     _debug_log(debug_file, f"PTY_DATA: Fed {len(decoded_data)} chars to pyte in {feed_duration:.6f}s")
-    
-    # Invalidate once after all data is processed
-    if not menu_is_active[0]:
-        app.invalidate()
-    
+
+    # Always invalidate - the layout will handle whether to show the menu or console
+    _debug_log(debug_file, f"PTY_DATA: Calling app.invalidate()")
+    app.invalidate()
+    _debug_log(debug_file, f"PTY_DATA: app.invalidate() returned")
+
     total_duration = time.time() - start_time
     _debug_log(debug_file, f"PTY_DATA: Total processing time {total_duration:.6f}s")
 
 
-async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_is_active, raw_log_file, debug_file=None):
+async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_state, raw_log_file, debug_file=None):
     """
     Reads data from the PTY in a loop using a thread pool executor.
 
     This approach uses `run_in_executor` to run the blocking `os.read` call in a
     separate thread, preventing it from blocking the main asyncio event loop. This
     is a robust pattern for integrating blocking I/O with asyncio.
-    
+
     When the PTY is closed (QEMU exits), this function will exit the application.
     """
-    _debug_log(debug_file, "PTY_READER: Starting read loop")
-    
+    _debug_log(debug_file, f"PTY_READER: Starting read loop (app id: {id(app)})")
+
     # Check if data is already available before the first read
-    # This helps diagnose the 31-second delay issue
     try:
         ready, _, _ = select.select([pty_fd], [], [], 0)
         if ready:
@@ -582,13 +666,14 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_is_active, ra
             _debug_log(debug_file, "PTY_READER: No data available yet, will block on first read")
     except Exception as e:
         _debug_log(debug_file, f"PTY_READER: select() error: {e}")
-    
+
     loop = asyncio.get_running_loop()
     read_count = 0
     try:
         while True:
             # Run the blocking os.read in the default thread pool executor
             read_start = time.time()
+            _debug_log(debug_file, f"PTY_READER: About to read (menu_visible={menu_state.is_visible})")
             data = await loop.run_in_executor(None, os.read, pty_fd, 4096)
             read_duration = time.time() - read_start
             read_count += 1
@@ -600,7 +685,7 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_is_active, ra
                 app.exit(result="QEMU exited")
                 break
 
-            _debug_log(debug_file, f"PTY_READER: Read #{read_count}: {len(data)} bytes in {read_duration:.6f}s")
+            _debug_log(debug_file, f"PTY_READER: Read #{read_count}: {len(data)} bytes in {read_duration:.6f}s (menu_visible={menu_state.is_visible})")
 
             # Log raw data if a log file is configured
             if raw_log_file:
@@ -612,7 +697,7 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_is_active, ra
 
             # Process the data for display
             process_start = time.time()
-            _process_pty_data(data, app, pyte_stream, menu_is_active, debug_file)
+            _process_pty_data(data, app, pyte_stream, menu_state, debug_file)
             process_duration = time.time() - process_start
             _debug_log(debug_file, f"PTY_READER: Processed data in {process_duration:.6f}s")
 
@@ -630,15 +715,14 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_is_active, ra
         app.exit(result="PTY reader crashed")
 
 
-def _process_monitor_data(data, app, monitor_pyte_stream, menu_is_active, debug_file=None):
+def _process_monitor_data(data, app, monitor_pyte_stream, menu_state, debug_file=None):
     """Feeds monitor data to the stream and invalidates the app."""
     _debug_log(debug_file, f"MONITOR_DATA: Processing {len(data)} bytes")
     monitor_pyte_stream.feed(data.decode("utf-8", "replace"))
-    if not menu_is_active[0]:
-        app.invalidate()
+    app.invalidate()
 
 
-async def _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue, menu_is_active, debug_file=None):
+async def _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue, menu_state, debug_file=None):
     """Reads data from the QEMU monitor socket and feeds it to the monitor pyte stream."""
     if not monitor_sock:
         _debug_log(debug_file, "MONITOR_READER: No monitor socket, exiting")
@@ -654,7 +738,7 @@ async def _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue, 
                 _debug_log(debug_file, f"MONITOR_READER: Connection closed after {read_count} reads")
                 return  # Monitor connection closed, but don't exit app
             _debug_log(debug_file, f"MONITOR_READER: Read #{read_count}: {len(data)} bytes")
-            _process_monitor_data(data, app, monitor_pyte_stream, menu_is_active, debug_file)
+            _process_monitor_data(data, app, monitor_pyte_stream, menu_state, debug_file)
         except Exception as e:
             _debug_log(debug_file, f"MONITOR_READER: Error after {read_count} reads: {e}")
             await _log_task_error(log_queue, "MONITOR", "ERROR")
@@ -671,6 +755,26 @@ async def _log_merger(log_queue, log_buffer, app):
             log_queue.task_done()
         except asyncio.CancelledError:
             break
+
+
+async def _menu_result_processor(app, menu_state, current_mode, monitor_sock, debug_file=None):
+    """Background task that processes menu results when the menu is dismissed."""
+    while True:
+        try:
+            # Wait a bit and check if menu was just dismissed with a result
+            await asyncio.sleep(0.1)
+
+            if not menu_state.is_visible and menu_state.result is not None:
+                result = menu_state.result
+                menu_state.result = None  # Clear the result
+
+                _debug_log(debug_file, f"MENU_PROCESSOR: Processing result: {result}")
+                await _process_control_menu_result(result, app, current_mode, monitor_sock, debug_file)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            _debug_log(debug_file, f"MENU_PROCESSOR: Error: {e}")
 
 
 def _cancel_async_tasks(tasks):
@@ -714,7 +818,7 @@ def _cleanup_console(qemu_process, tasks, pty_fd, monitor_sock, attr_log_file, r
 def _get_verified_terminal_size(debug_file=None):
     """
     Gets and verifies the terminal size, with extensive logging.
-    
+
     Returns: (cols, rows) tuple with validated dimensions
     """
     # Try ioctl first as it's the most reliable
@@ -722,22 +826,22 @@ def _get_verified_terminal_size(debug_file=None):
         winsize = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b'\x00' * 8)
         rows, cols = struct.unpack('HHHH', winsize)[:2]
         _debug_log(debug_file, f"TERMSIZE: ioctl(TIOCGWINSZ) returned rows={rows}, cols={cols}")
-        
+
         if rows > 0 and cols > 0:
             # Sanity check the values
             if rows < 20 or rows > 200:
                 _debug_log(debug_file, f"TERMSIZE: WARNING: Unusual row count {rows}, clamping to range [24, 100]")
                 rows = max(24, min(rows, 100))
-            
+
             if cols < 40 or cols > 500:
                 _debug_log(debug_file, f"TERMSIZE: WARNING: Unusual column count {cols}, clamping to range [80, 200]")
                 cols = max(80, min(cols, 200))
-            
+
             _debug_log(debug_file, f"TERMSIZE: Final verified size: rows={rows}, cols={cols}")
             return cols, rows
     except Exception as e:
         _debug_log(debug_file, f"TERMSIZE: ioctl(TIOCGWINSZ) failed: {e}")
-    
+
     # Fallback to shutil
     try:
         size = shutil.get_terminal_size(fallback=(80, 24))
@@ -747,7 +851,7 @@ def _get_verified_terminal_size(debug_file=None):
         return cols, rows
     except Exception as e:
         _debug_log(debug_file, f"TERMSIZE: shutil.get_terminal_size() failed: {e}")
-    
+
     # Ultimate fallback
     _debug_log(debug_file, "TERMSIZE: Using fallback 80x24")
     return 80, 24
@@ -756,17 +860,17 @@ def _get_verified_terminal_size(debug_file=None):
 def _initialize_console_state(debug_file=None):
     """Initializes all stateful components for the console session."""
     _debug_log(debug_file, "INIT: Initializing console state")
-    
+
     log_queue = Queue()
     log_buffer = Buffer(read_only=True)
     current_mode = [
         app_config.MODE_SERIAL_CONSOLE
     ]  # List to be mutable from closures
-    menu_is_active = [False]  # List to be mutable from closures
+    menu_state = ControlMenuState()
 
     # Get verified terminal size with extensive logging
     cols, rows = _get_verified_terminal_size(debug_file)
-    
+
     _debug_log(debug_file, f"INIT: Creating pyte screen with cols={cols}, rows={rows}")
 
     pyte_screen = pyte.Screen(cols, rows)
@@ -774,20 +878,23 @@ def _initialize_console_state(debug_file=None):
     monitor_pyte_screen = pyte.Screen(cols, rows)
     monitor_pyte_stream = pyte.Stream(monitor_pyte_screen)
 
-    return log_queue, log_buffer, current_mode, menu_is_active, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream
+    return log_queue, log_buffer, current_mode, menu_state, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream
 
 
-def _fix_termios_state(debug_file=None):
+def _apply_termios_hardening(debug_file=None):
     """
-    Fixes corrupted termios state on stdin before prompt_toolkit starts.
-    Also hardens the state by disabling flow control and extended input processing.
+    Applies additional termios hardening on top of prompt_toolkit's raw mode.
 
-    This addresses:
-    1. A bug where termios.tcgetattr() returns bytes in the cc array.
-    2. Potential kernel-level consumption of keystrokes due to flow control (IXON/IXOFF)
-       or extended input processing (IEXTEN).
+    This function must be called AFTER the Application is created but BEFORE
+    app.run_async() is called. It ensures that control characters like Ctrl-]
+    are not intercepted by the kernel.
+
+    Disables:
+    - ISIG: Signal generation (Ctrl-C, Ctrl-Z, etc.)
+    - IEXTEN: Extended input processing
+    - IXON/IXOFF: Software flow control (Ctrl-S/Ctrl-Q)
     """
-    _debug_log(debug_file, "TERMIOS: Checking and fixing terminal state")
+    _debug_log(debug_file, "TERMIOS_HARDEN: Applying additional hardening")
     try:
         # Get current terminal attributes
         attrs = termios.tcgetattr(sys.stdin.fileno())
@@ -795,63 +902,41 @@ def _fix_termios_state(debug_file=None):
         # attrs is a list: [iflag, oflag, cflag, lflag, ispeed, ospeed, cc]
         iflag = attrs[0]
         lflag = attrs[3]
-        cc = attrs[6]
 
-        needs_fix = False
+        _debug_log(debug_file, f"TERMIOS_HARDEN: Before - iflag={iflag:08x}, lflag={lflag:08x}")
 
-        # 1. Fix corrupted CC array (bytes instead of ints)
-        fixed_cc = []
-        for item in cc:
-            if isinstance(item, bytes):
-                # Convert bytes to integer (take first byte if non-empty, else 0)
-                fixed_value = item[0] if len(item) > 0 else 0
-                fixed_cc.append(fixed_value)
-                needs_fix = True
-            elif isinstance(item, int):
-                # Already an integer, keep as-is
-                fixed_cc.append(item)
-            else:
-                # Unexpected type, convert to int if possible
-                try:
-                    fixed_cc.append(int(item))
-                    needs_fix = True
-                except (ValueError, TypeError):
-                    # If conversion fails, use 0 as a safe default
-                    fixed_cc.append(0)
-                    needs_fix = True
-
-        if needs_fix:
-             attrs[6] = fixed_cc
-             print("Fixed corrupted terminal state (cc array contained bytes instead of integers)", file=sys.stderr)
-             _debug_log(debug_file, "TERMIOS: Fixed corrupted cc array")
-
-        # 2. Harden Termios: Disable signals, flow control, and extended input.
-        # ISIG: When enabled, Ctrl-C (INTR) and others generate signals. Disabling
-        #       this allows prompt-toolkit to handle them as raw key presses.
-        # IXON/IXOFF: Software flow control (Ctrl-S/Ctrl-Q).
-        # IEXTEN: Implementation-defined input processing.
-        # We disable these to ensure raw input reaches the application.
+        # Disable additional flags that might interfere with control character capture
         new_iflag = iflag & ~(termios.IXON | termios.IXOFF)
         new_lflag = lflag & ~(termios.ISIG | termios.IEXTEN)
 
-        if new_iflag != iflag or new_lflag != lflag:
-            attrs[0] = new_iflag
-            attrs[3] = new_lflag
-            needs_fix = True
-            print("Hardening termios: Disabled ISIG, IXON, IXOFF, IEXTEN", file=sys.stderr)
-            _debug_log(debug_file, "TERMIOS: Hardened terminal state (disabled ISIG, IXON, IXOFF, IEXTEN)")
+        attrs[0] = new_iflag
+        attrs[3] = new_lflag
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attrs)
 
-        # Apply changes if needed
-        if needs_fix:
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attrs)
-            _debug_log(debug_file, "TERMIOS: Applied terminal state changes")
+        _debug_log(debug_file, f"TERMIOS_HARDEN: After - iflag={new_iflag:08x}, lflag={new_lflag:08x}")
+        _debug_log(debug_file, "TERMIOS_HARDEN: Applied hardening (disabled ISIG, IEXTEN, IXON, IXOFF)")
+
+        # Verify the hardening was applied
+        verify_attrs = termios.tcgetattr(sys.stdin.fileno())
+        verify_iflag = verify_attrs[0]
+        verify_lflag = verify_attrs[3]
+
+        has_ixon = bool(verify_iflag & termios.IXON)
+        has_ixoff = bool(verify_iflag & termios.IXOFF)
+        has_isig = bool(verify_lflag & termios.ISIG)
+        has_iexten = bool(verify_lflag & termios.IEXTEN)
+
+        _debug_log(debug_file, f"TERMIOS_HARDEN: Verification - IXON={has_ixon}, IXOFF={has_ixoff}, ISIG={has_isig}, IEXTEN={has_iexten}")
+
+        if has_ixon or has_ixoff or has_isig or has_iexten:
+            _debug_log(debug_file, "TERMIOS_HARDEN: WARNING - Some flags are still enabled!")
         else:
-            _debug_log(debug_file, "TERMIOS: Terminal state is already correct")
+            _debug_log(debug_file, "TERMIOS_HARDEN: Verification successful - all flags disabled")
 
     except Exception as e:
-        # If we can't fix the terminal state, log the error but continue
-        print(f"Warning: Could not fix/harden terminal state: {e}", file=sys.stderr)
-        _debug_log(debug_file, f"TERMIOS: Error fixing terminal state: {e}")
+        # Log the error but don't fail - prompt_toolkit's raw mode should still work
+        _debug_log(debug_file, f"TERMIOS_HARDEN: Error applying hardening: {e}")
+        print(f"Warning: Could not apply additional terminal hardening: {e}", file=sys.stderr)
 
 
 def _setup_console_app(
@@ -861,7 +946,7 @@ def _setup_console_app(
     log_buffer,
     pyte_screen,
     monitor_pyte_screen,
-    menu_is_active,
+    menu_state,
     attr_log_file,
     debug_file=None,
 ):
@@ -893,39 +978,54 @@ def _setup_console_app(
 
         return _get_pty_screen_fragments(monitor_pyte_screen, attr_log_file, debug_file)
 
-    key_bindings = _create_key_bindings(
-        current_mode, pty_fd, monitor_sock, menu_is_active, debug_file
-    )
-    layout = _create_console_layout(
+    layout, main_content_container = _create_console_layout(
         get_pty_screen_fragments,
         get_monitor_screen_fragments,
         current_mode,
         pyte_screen,
         monitor_pyte_screen,
+        menu_state,
+        debug_file,
     )
+
+    key_bindings = _create_key_bindings(
+        current_mode, pty_fd, monitor_sock, menu_state, main_content_container, debug_file
+    )
+
+    # Define a simple style for the dialog to make it visually distinct
+    dialog_style = Style.from_dict({
+        "dialog.title": "bg:#0000aa #ffffff bold",
+        "dialog.body":  "bg:#aaaaaa #000000",
+        "dialog.button": "bg:#000000 #ffffff",
+    })
 
     app = Application(
         layout=layout,
         key_bindings=key_bindings,
         full_screen=True,
         mouse_support=True,
+        style=dialog_style,
     )
-    _debug_log(debug_file, "APP: Console application setup complete")
+    _debug_log(debug_file, f"APP: Console application setup complete (app id: {id(app)})")
     return app
 
 
-def _create_async_tasks(app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, menu_is_active, raw_log_file, debug_file=None):
+def _create_async_tasks(app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, menu_state, current_mode, raw_log_file, debug_file=None):
     """Creates and returns all background asyncio tasks."""
     _debug_log(debug_file, "TASKS: Creating async tasks")
+
     pty_reader_task = asyncio.create_task(
-        _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_is_active, raw_log_file, debug_file)
+        _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_state, raw_log_file, debug_file)
     )
     monitor_reader_task = asyncio.create_task(
-        _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue, menu_is_active, debug_file)
+        _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue, menu_state, debug_file)
     )
     merger_task = asyncio.create_task(_log_merger(log_queue, log_buffer, app))
-    _debug_log(debug_file, "TASKS: Created 3 async tasks (PTY reader, monitor reader, log merger)")
-    return [pty_reader_task, monitor_reader_task, merger_task]
+    menu_processor_task = asyncio.create_task(
+        _menu_result_processor(app, menu_state, current_mode, monitor_sock, debug_file)
+    )
+    _debug_log(debug_file, "TASKS: Created 4 async tasks (PTY reader, monitor reader, log merger, menu processor)")
+    return [pty_reader_task, monitor_reader_task, merger_task, menu_processor_task]
 
 
 async def _run_application_loop(app, pty_device, current_mode, pty_fd, debug_file=None):
@@ -934,7 +1034,7 @@ async def _run_application_loop(app, pty_device, current_mode, pty_fd, debug_fil
         f"\nConnected to serial console: {pty_device}\nPress Ctrl-] for control menu.\n",
         flush=True,
     )
-    _debug_log(debug_file, "APP_LOOP: Starting prompt_toolkit application")
+    _debug_log(debug_file, f"APP_LOOP: Starting prompt_toolkit application (app id: {id(app)})")
 
     result = await app.run_async() or ""
     _debug_log(debug_file, f"APP_LOOP: Application exited with result: {result}")
@@ -978,7 +1078,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
             debug_path.parent.mkdir(parents=True, exist_ok=True)
             debug_file = open(debug_path, "w", encoding="utf-8", buffering=1)
             _debug_log(debug_file, "=== DEBUG SESSION STARTED ===")
-            
+
             # Log timing information from process.py if available
             if debug_info:
                 _debug_log(debug_file, f"TIMING: QEMU started at {debug_info.get('qemu_start', 0):.6f}")
@@ -998,7 +1098,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         log_queue,
         log_buffer,
         current_mode,
-        menu_is_active,
+        menu_state,
         pyte_screen,
         pyte_stream,
         monitor_pyte_screen,
@@ -1042,10 +1142,6 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
             debug_file.close()
         return 1
 
-    # Fix any corrupted termios state before starting prompt_toolkit
-    # This prevents the first keystroke from being consumed during error recovery
-    _fix_termios_state(debug_file)
-
     # Set the initial PTY size to match the current terminal size.
     # This ensures the guest OS (e.g., GRUB, Linux) formats its output correctly from boot.
     _set_pty_size(pty_fd, pyte_screen.lines, pyte_screen.columns, debug_file)
@@ -1059,13 +1155,17 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         log_buffer,
         pyte_screen,
         monitor_pyte_screen,
-        menu_is_active,
+        menu_state,
         attr_log_file,
         debug_file,
     )
 
+    # Apply termios hardening AFTER app is created but BEFORE run_async()
+    # This ensures control characters like Ctrl-] are captured by the app
+    _apply_termios_hardening(debug_file)
+
     tasks = _create_async_tasks(
-        app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, menu_is_active, raw_log_file, debug_file
+        app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, menu_state, current_mode, raw_log_file, debug_file
     )
 
     return_code = await _manage_console_session(
