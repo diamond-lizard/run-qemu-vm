@@ -418,7 +418,8 @@ def _create_key_bindings(current_mode, pty_fd, monitor_sock, menu_is_active, deb
     # Eagerly bind Ctrl-] to open the control menu.
     # This must be eager to preempt prompt_toolkit's default behavior for some
     # control characters and the <any> fallback.
-    @key_bindings.add("\x1d", eager=True)  # Ctrl-]
+    # Use 'c-]' which is the correct symbolic notation for Ctrl-] in prompt_toolkit.
+    @key_bindings.add("c-]", eager=True)  # Ctrl-]
     async def _(event):
         await _handle_control_menu(
             event.app, current_mode, monitor_sock, menu_is_active, debug_file
