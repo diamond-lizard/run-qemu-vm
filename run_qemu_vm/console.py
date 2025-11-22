@@ -143,7 +143,7 @@ def _process_line_to_fragments(y, pyte_screen):
     return line_fragments
 
 
-def _get_pty_screen_fragments(pyte_screen, attr_log_file=None, debug_file=None):
+def _get_pty_screen_fragments(pyte_screen, source_name, attr_log_file=None, debug_file=None):
     """Converts the entire pyte screen state into prompt_toolkit fragments."""
     _debug_log(debug_file, f"RENDER: Starting fragment generation. Cursor at ({pyte_screen.cursor.x}, {pyte_screen.cursor.y})")
 
@@ -161,14 +161,12 @@ def _get_pty_screen_fragments(pyte_screen, attr_log_file=None, debug_file=None):
         line_fragments = _process_line_to_fragments(y, pyte_screen)
 
         if attr_log_file:
-            # Log any fragment that is not a default-styled space character.
-            log_parts = []
-            for style, text in line_fragments:
-                if style != "" or text != " ":
-                    log_parts.append(f"[{style}]{repr(text)}")
-
-            if log_parts:
-                attr_log_file.write(f"Line {y:2d}: {''.join(log_parts)}\n")
+            # New, simpler logging logic.
+            # This logs the raw text content of the line directly from pyte's display buffer.
+            # This is less detailed (no styles) but more robust for debugging.
+            line_text = pyte_screen.display[y]
+            if line_text.strip():
+                attr_log_file.write(f"[{source_name}] Line {y:2d}: {repr(line_text)}\n")
                 attr_log_file.flush()
                 non_empty_lines += 1
 
@@ -380,16 +378,25 @@ async def _handle_monitor_action(app, current_mode, monitor_sock, debug_file=Non
             pass
 
 
-async def _handle_resume_action(app, current_mode, debug_file=None):
+async def _handle_resume_action(app, current_mode, pty_fd, pty_reader_callback, debug_file=None):
     """Handles the 'resume' action from the control menu."""
     _debug_log(debug_file, "MENU: User selected resume console")
+
+    # Resume PTY reader by adding it back to the event loop
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_reader(pty_fd, pty_reader_callback)
+        _debug_log(debug_file, "MENU: PTY reader resumed")
+    except Exception as e:
+        _debug_log(debug_file, f"MENU: Error resuming PTY reader: {e}")
+
     current_mode[0] = app_config.MODE_SERIAL_CONSOLE
     app.renderer.reset()
     app.invalidate()
 
 
 async def _process_control_menu_result(
-    result, app, current_mode, monitor_sock, debug_file=None
+    result, app, current_mode, monitor_sock, pty_fd, pty_reader_callback, debug_file=None
 ):
     """Handles the action selected from the control menu."""
     _debug_log(debug_file, f"MENU: Processing menu result: {result}")
@@ -398,12 +405,22 @@ async def _process_control_menu_result(
     elif result == "monitor":
         await _handle_monitor_action(app, current_mode, monitor_sock, debug_file)
     else:  # resume
-        await _handle_resume_action(app, current_mode, debug_file)
+        await _handle_resume_action(app, current_mode, pty_fd, pty_reader_callback, debug_file)
 
 
-def _show_control_menu(app, menu_state, current_mode, monitor_sock, main_content_container, debug_file=None):
-    """Shows the control menu dialog."""
+def _show_control_menu(app, menu_state, pty_fd, debug_file=None):
+    """Shows the control menu dialog and pauses the PTY reader."""
     _debug_log(debug_file, f"MENU: Showing control menu (app id: {id(app)})")
+
+    # Pause PTY reader by removing it from the event loop
+    loop = asyncio.get_running_loop()
+    try:
+        loop.remove_reader(pty_fd)
+        _debug_log(debug_file, "MENU: PTY reader paused")
+    except Exception as e:
+        # It might already be removed, which is fine.
+        _debug_log(debug_file, f"MENU: Info removing PTY reader (might be normal): {e}")
+
     menu_state.is_visible = True
     menu_state.result = None
     app.invalidate()
@@ -457,7 +474,7 @@ def _create_key_bindings(current_mode, pty_fd, monitor_sock, menu_state, main_co
     @key_bindings.add("c-]", eager=True, filter=menu_not_active)
     def show_menu(event):
         _debug_log(debug_file, f"KEYBIND: Ctrl-] pressed (app id: {id(event.app)})")
-        _show_control_menu(event.app, menu_state, current_mode, monitor_sock, main_content_container, debug_file)
+        _show_control_menu(event.app, menu_state, pty_fd, debug_file)
 
     # Bind 'r' to resume when menu is active
     @key_bindings.add("r", filter=menu_is_active, eager=True)
@@ -645,47 +662,34 @@ def _process_pty_data(data, app, pyte_stream, menu_state, debug_file=None):
     _debug_log(debug_file, f"PTY_DATA: Total processing time {total_duration:.6f}s")
 
 
-async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_state, raw_log_file, debug_file=None):
+def _create_pty_reader_callback(app, pty_fd, pyte_stream, menu_state, raw_log_file, debug_file=None):
     """
-    Reads data from the PTY in a loop using a thread pool executor.
+    Creates a callback function for the asyncio event loop to handle PTY data.
 
-    This approach uses `run_in_executor` to run the blocking `os.read` call in a
-    separate thread, preventing it from blocking the main asyncio event loop. This
-    is a robust pattern for integrating blocking I/O with asyncio.
-
-    When the PTY is closed (QEMU exits), this function will exit the application.
+    This callback reads available data from the PTY, processes it, and handles
+    the end-of-file condition when QEMU exits.
     """
-    _debug_log(debug_file, f"PTY_READER: Starting read loop (app id: {id(app)})")
-
-    # Check if data is already available before the first read
-    try:
-        ready, _, _ = select.select([pty_fd], [], [], 0)
-        if ready:
-            _debug_log(debug_file, "PTY_READER: Data already available before first read")
-        else:
-            _debug_log(debug_file, "PTY_READER: No data available yet, will block on first read")
-    except Exception as e:
-        _debug_log(debug_file, f"PTY_READER: select() error: {e}")
-
-    loop = asyncio.get_running_loop()
     read_count = 0
-    try:
-        while True:
-            # Run the blocking os.read in the default thread pool executor
-            read_start = time.time()
-            _debug_log(debug_file, f"PTY_READER: About to read (menu_visible={menu_state.is_visible})")
-            data = await loop.run_in_executor(None, os.read, pty_fd, 4096)
-            read_duration = time.time() - read_start
+
+    def _pty_reader_callback():
+        """The actual callback passed to loop.add_reader()."""
+        nonlocal read_count
+        try:
+            # Read data from the PTY file descriptor. This is non-blocking because
+            # the event loop only calls us when data is ready.
+            data = os.read(pty_fd, 4096)
             read_count += 1
 
             if not data:
                 # PTY closed, QEMU has exited
                 _debug_log(debug_file, f"PTY_READER: PTY closed after {read_count} reads - QEMU has exited")
+                # Stop listening before exiting
+                asyncio.get_running_loop().remove_reader(pty_fd)
                 # Exit the application cleanly
                 app.exit(result="QEMU exited")
-                break
+                return
 
-            _debug_log(debug_file, f"PTY_READER: Read #{read_count}: {len(data)} bytes in {read_duration:.6f}s (menu_visible={menu_state.is_visible})")
+            _debug_log(debug_file, f"PTY_READER: Read #{read_count}: {len(data)} bytes")
 
             # Log raw data if a log file is configured
             if raw_log_file:
@@ -696,23 +700,25 @@ async def _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_state, raw_lo
                     pass  # Ignore errors if the file is closed or invalid
 
             # Process the data for display
-            process_start = time.time()
             _process_pty_data(data, app, pyte_stream, menu_state, debug_file)
-            process_duration = time.time() - process_start
-            _debug_log(debug_file, f"PTY_READER: Processed data in {process_duration:.6f}s")
 
-    except OSError as e:
-        # This can happen if the PTY is closed while we are waiting to read,
-        # for example, during a clean shutdown.
-        _debug_log(debug_file, f"PTY_READER: OSError after {read_count} reads: {e}")
-        # Exit the application on error as well
-        app.exit(result="PTY error")
-    except Exception as e:
-        # Log any other unexpected errors and exit the loop
-        _debug_log(debug_file, f"PTY_READER: Unexpected error after {read_count} reads: {e}")
-        await _log_task_error(log_queue, "PTY READER", "CRASHED")
-        # Exit the application
-        app.exit(result="PTY reader crashed")
+        except BlockingIOError:
+            # This can happen if we read when there's no data. It's not an error.
+            _debug_log(debug_file, "PTY_READER: BlockingIOError, no data to read.")
+            pass
+        except OSError as e:
+            # This can happen if the PTY is closed while we are waiting to read.
+            _debug_log(debug_file, f"PTY_READER: OSError after {read_count} reads: {e}")
+            asyncio.get_running_loop().remove_reader(pty_fd)
+            app.exit(result="PTY error")
+        except Exception:
+            # Log any other unexpected errors and exit
+            tb_str = traceback.format_exc()
+            _debug_log(debug_file, f"PTY_READER: CRASHED after {read_count} reads:\n{tb_str}")
+            asyncio.get_running_loop().remove_reader(pty_fd)
+            app.exit(result="PTY reader crashed")
+
+    return _pty_reader_callback
 
 
 def _process_monitor_data(data, app, monitor_pyte_stream, menu_state, debug_file=None):
@@ -745,6 +751,29 @@ async def _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue, 
             return
 
 
+async def _process_qemu_output_queue(app, output_queue, monitor_pyte_stream, debug_file=None):
+    """Reads QEMU stdout lines from the queue and feeds them to the monitor screen."""
+    _debug_log(debug_file, "OUTPUT_PROCESSOR: Starting")
+    while True:
+        try:
+            # Process all available lines in the queue
+            lines_processed = 0
+            while not output_queue.empty():
+                line = output_queue.get_nowait()
+                monitor_pyte_stream.feed(line)
+                lines_processed += 1
+
+            if lines_processed > 0:
+                app.invalidate()
+
+            await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            _debug_log(debug_file, f"OUTPUT_PROCESSOR: Error: {e}")
+            await asyncio.sleep(1)
+
+
 async def _log_merger(log_queue, log_buffer, app):
     """Merges log messages from a queue into the log buffer."""
     while True:
@@ -757,7 +786,7 @@ async def _log_merger(log_queue, log_buffer, app):
             break
 
 
-async def _menu_result_processor(app, menu_state, current_mode, monitor_sock, debug_file=None):
+async def _menu_result_processor(app, menu_state, current_mode, monitor_sock, pty_fd, pty_reader_callback, debug_file=None):
     """Background task that processes menu results when the menu is dismissed."""
     while True:
         try:
@@ -769,7 +798,9 @@ async def _menu_result_processor(app, menu_state, current_mode, monitor_sock, de
                 menu_state.result = None  # Clear the result
 
                 _debug_log(debug_file, f"MENU_PROCESSOR: Processing result: {result}")
-                await _process_control_menu_result(result, app, current_mode, monitor_sock, debug_file)
+                await _process_control_menu_result(
+                    result, app, current_mode, monitor_sock, pty_fd, pty_reader_callback, debug_file
+                )
 
         except asyncio.CancelledError:
             break
@@ -967,7 +998,7 @@ def _setup_console_app(
             # Inform the guest OS of the new size via ioctl
             _set_pty_size(pty_fd, rows, cols, debug_file)
 
-        return _get_pty_screen_fragments(pyte_screen, attr_log_file, debug_file)
+        return _get_pty_screen_fragments(pyte_screen, "PTY", attr_log_file, debug_file)
 
     def get_monitor_screen_fragments():
         """Wrapper to pass monitor_pyte_screen to the fragment generator."""
@@ -976,7 +1007,7 @@ def _setup_console_app(
         if monitor_pyte_screen.columns != cols or monitor_pyte_screen.lines != rows:
             monitor_pyte_screen.resize(lines=rows, columns=cols)
 
-        return _get_pty_screen_fragments(monitor_pyte_screen, attr_log_file, debug_file)
+        return _get_pty_screen_fragments(monitor_pyte_screen, "MONITOR", attr_log_file, debug_file)
 
     layout, main_content_container = _create_console_layout(
         get_pty_screen_fragments,
@@ -1010,22 +1041,23 @@ def _setup_console_app(
     return app
 
 
-def _create_async_tasks(app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, menu_state, current_mode, raw_log_file, debug_file=None):
+def _create_async_tasks(app, pty_fd, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, menu_state, current_mode, pty_reader_callback, qemu_output_queue, debug_file=None):
     """Creates and returns all background asyncio tasks."""
     _debug_log(debug_file, "TASKS: Creating async tasks")
 
-    pty_reader_task = asyncio.create_task(
-        _read_from_pty(app, pty_fd, pyte_stream, log_queue, menu_state, raw_log_file, debug_file)
-    )
     monitor_reader_task = asyncio.create_task(
         _read_from_monitor(app, monitor_pyte_stream, monitor_sock, log_queue, menu_state, debug_file)
     )
     merger_task = asyncio.create_task(_log_merger(log_queue, log_buffer, app))
     menu_processor_task = asyncio.create_task(
-        _menu_result_processor(app, menu_state, current_mode, monitor_sock, debug_file)
+        _menu_result_processor(app, menu_state, current_mode, monitor_sock, pty_fd, pty_reader_callback, debug_file)
     )
-    _debug_log(debug_file, "TASKS: Created 4 async tasks (PTY reader, monitor reader, log merger, menu processor)")
-    return [pty_reader_task, monitor_reader_task, merger_task, menu_processor_task]
+    output_processor_task = asyncio.create_task(
+        _process_qemu_output_queue(app, qemu_output_queue, monitor_pyte_stream, debug_file)
+    )
+
+    _debug_log(debug_file, "TASKS: Created 4 async tasks (monitor reader, log merger, menu processor, output processor)")
+    return [monitor_reader_task, merger_task, menu_processor_task, output_processor_task]
 
 
 async def _run_application_loop(app, pty_device, current_mode, pty_fd, debug_file=None):
@@ -1062,6 +1094,14 @@ async def _manage_console_session(
         _debug_log(debug_file, f"SESSION: Application error: {e}")
         return_code = 1
     finally:
+        # Unregister PTY reader before cleaning up other resources
+        try:
+            loop = asyncio.get_running_loop()
+            loop.remove_reader(pty_fd)
+            _debug_log(debug_file, "CLEANUP: PTY reader unregistered")
+        except Exception:
+            pass  # Ignore errors if already removed or loop is closing
+
         _cleanup_console(qemu_process, tasks, pty_fd, monitor_sock, attr_log_file, raw_log_file, debug_file)
         return_code = qemu_process.returncode or 0
         _debug_log(debug_file, f"SESSION: Exiting with return code {return_code}")
@@ -1069,7 +1109,7 @@ async def _manage_console_session(
     return return_code
 
 
-async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_path, debug_info=None):
+async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_path, qemu_output_queue, debug_info=None):
     """Manages a prompt_toolkit-based text console session for QEMU."""
     debug_file = None
     if app_config.DEBUG_FILE:
@@ -1164,9 +1204,20 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
     # This ensures control characters like Ctrl-] are captured by the app
     _apply_termios_hardening(debug_file)
 
-    tasks = _create_async_tasks(
-        app, pty_fd, pyte_stream, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, menu_state, current_mode, raw_log_file, debug_file
+    # Create the PTY reader callback. This function will be registered and
+    # deregistered from the event loop as needed.
+    pty_reader_callback = _create_pty_reader_callback(
+        app, pty_fd, pyte_stream, menu_state, raw_log_file, debug_file
     )
+
+    tasks = _create_async_tasks(
+        app, pty_fd, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, menu_state, current_mode, pty_reader_callback, qemu_output_queue, debug_file
+    )
+
+    # Register the initial PTY reader with the event loop
+    loop = asyncio.get_running_loop()
+    loop.add_reader(pty_fd, pty_reader_callback)
+    _debug_log(debug_file, "TASKS: PTY reader registered with event loop")
 
     return_code = await _manage_console_session(
         app,

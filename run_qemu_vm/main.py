@@ -90,11 +90,38 @@ def build_qemu_args(config):
         config['monitor_socket'] = monitor_socket
         args.extend(["-monitor", f"unix:{monitor_socket},server,nowait", "-chardev", "pty,id=char0"])
 
-        serial_profile_key = config.get("serial_device") or app_config.ARCH_DEFAULT_SERIAL.get(config['architecture'], app_config.ARCH_DEFAULT_SERIAL['default'])
+        # For x86/x86_64 text mode, we MUST use the ISA serial port ('pc' profile)
+        # because SeaBIOS writes to port 0x3f8 (COM1). VirtIO serial won't capture BIOS output.
+        is_x86 = config['architecture'] in ['x86_64', 'i386']
+
+        serial_profile_key = config.get("serial_device")
+
+        if not serial_profile_key:
+            if is_x86:
+                # Force 'pc' (ISA serial) profile for x86 text mode to ensure BIOS/GRUB visibility
+                serial_profile_key = 'pc'
+                print("Info: Auto-selecting 'pc' serial profile for BIOS/GRUB visibility.")
+            else:
+                serial_profile_key = app_config.ARCH_DEFAULT_SERIAL.get(config['architecture'], app_config.ARCH_DEFAULT_SERIAL['default'])
+
+        # Warn if user manually selected a profile that might hide BIOS output on x86
+        if is_x86 and serial_profile_key != 'pc':
+             print(f"Warning: Using '{serial_profile_key}' on x86 text mode might hide BIOS/GRUB messages. 'pc' (ISA Serial) is recommended.", file=sys.stderr)
+
         serial_args = app_config.SERIAL_DEVICE_PROFILES[serial_profile_key]['args']
+
+        # HOTFIX: The 'pc' profile defaults to "-device isa-serial", which conflicts with
+        # the built-in serial port on 'q35' and 'pc' machine types.
+        # We override it here to use "-serial" which attaches to the built-in port instead.
+        if serial_profile_key == 'pc':
+            serial_args = ["-serial", "chardev:char0"]
+
         print(f"Info: Using '{serial_profile_key}' serial profile.")
         args.extend(serial_args)
-        args.append("-nographic")
+
+        # Use -nographic to signal SeaBIOS to enable serial console (sercon).
+        # We also keep -display none for explicit headless definition.
+        args.extend(["-nographic", "-display", "none"])
     else:
         vga_type = config.get('vga_type')
         if not vga_type:
