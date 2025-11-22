@@ -11,6 +11,7 @@ import termios
 import time
 import traceback
 from asyncio import Queue
+from functools import lru_cache
 from pathlib import Path
 
 import pyte
@@ -73,6 +74,7 @@ class AnsiColorProcessor(Processor):
         return Transformation(fragments)
 
 
+@lru_cache(maxsize=4096)
 def _get_char_style(char):
     """Generates a prompt_toolkit style string from a pyte character."""
     style_parts = []
@@ -122,15 +124,22 @@ def _process_line_to_fragments(y, pyte_screen):
     This function combines the character data from `pyte_screen.display` (which
     correctly translates ACS characters) with the style information from
     `pyte_screen.buffer` to produce a list of `(style, text)` fragments.
-    This version creates one fragment per character for simplicity and robustness.
+
+    Optimized with Run-Length Encoding (RLE) to group adjacent characters
+    with identical styles, significantly reducing rendering overhead.
     """
     line_fragments = []
     # pyte_screen.display contains the rendered text, including ACS translations.
     display_line = pyte_screen.display[y]
+    buffer_line = pyte_screen.buffer[y]
+    width = pyte_screen.columns
 
-    for x in range(pyte_screen.columns):
+    current_style = None
+    current_text_parts = []
+
+    for x in range(width):
         # Get the character's style information from the buffer.
-        char_style_info = pyte_screen.buffer[y][x]
+        char_style_info = buffer_line[x]
 
         # Get the character's data from the display property.
         # Pad with spaces if the display line is shorter than the screen width,
@@ -138,7 +147,22 @@ def _process_line_to_fragments(y, pyte_screen):
         char_data = display_line[x] if x < len(display_line) else " "
 
         style_str = _get_char_style(char_style_info)
-        line_fragments.append((style_str, char_data))
+
+        if style_str != current_style:
+            # Style changed: flush the previous group
+            if current_style is not None:
+                line_fragments.append((current_style, "".join(current_text_parts)))
+
+            # Start new group
+            current_style = style_str
+            current_text_parts = [char_data]
+        else:
+            # Style same: accumulate character
+            current_text_parts.append(char_data)
+
+    # Flush the final group
+    if current_style is not None:
+        line_fragments.append((current_style, "".join(current_text_parts)))
 
     return line_fragments
 
