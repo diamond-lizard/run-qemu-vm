@@ -64,7 +64,7 @@ def run_qemu(args, config):
 
             # Give QEMU a moment to fully initialize the PTY connection
             # This prevents the race condition where we open the PTY before QEMU connects
-            time.sleep(0.5)
+            time.sleep(0.05)
             debug_info['console_start'] = time.time()
 
             # Hand off to the prompt_toolkit console manager
