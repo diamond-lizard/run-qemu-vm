@@ -1003,8 +1003,11 @@ def _apply_termios_hardening(debug_file=None):
     """
     _debug_log(debug_file, "TERMIOS_HARDEN: Applying additional hardening")
     try:
-        # Get current terminal attributes
-        attrs = termios.tcgetattr(sys.stdin.fileno())
+        # Get and save current terminal attributes BEFORE modification
+        original_attrs = termios.tcgetattr(sys.stdin.fileno())
+
+        # Make a copy to modify
+        attrs = original_attrs[:]
 
         # attrs is a list: [iflag, oflag, cflag, lflag, ispeed, ospeed, cc]
         iflag = attrs[0]
