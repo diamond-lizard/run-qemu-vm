@@ -39,9 +39,13 @@ from . import config as app_config
 def _debug_log(debug_file, message):
     """Writes a timestamped debug message to the debug file if enabled."""
     if debug_file:
-        timestamp = time.time()
-        debug_file.write(f"[{timestamp:.6f}] {message}\n")
-        debug_file.flush()
+        try:
+            timestamp = time.time()
+            debug_file.write(f"[{timestamp:.6f}] {message}\n")
+            debug_file.flush()
+        except (ValueError, OSError):
+            # File might be closed if called from atexit, ignore silently
+            pass
 
 
 class AnsiColorProcessor(Processor):
