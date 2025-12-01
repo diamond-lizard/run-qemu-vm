@@ -630,27 +630,38 @@ async def _log_task_error(log_queue: Queue, task_name: str, error_type: str = "E
 
 def _filter_cursor_position_queries(data):
     """
-    Filters out cursor position query sequences (CPR) from the data stream.
+    Filters out escape sequences that pyte cannot handle correctly.
 
-    These sequences (ESC[6n) are sometimes sent by the guest and can cause
-    cursor position issues. We filter them out to prevent interference.
+    This includes:
+    - Cursor position queries (ESC[6n) which can cause cursor position issues
+    - DECSTR sequences (ESC[!p) which contain intermediate characters that pyte
+      doesn't support, causing the 'p' to leak as literal text
+    - Extreme cursor position movements (ESC[large;largeH) which cause out-of-bounds cursor positioning
 
-    Returns: (filtered_data, had_cpr)
+    Returns: (filtered_data, had_filter)
     """
     original_len = len(data)
 
     # Remove cursor position queries (ESC[6n)
     filtered = data.replace(b'\x1b[6n', b'')
 
-    # Remove extreme cursor position movements (anything moving to row/col > 1000)
-    # This is a heuristic to catch ESC[32766;32766H type sequences
+    # Remove DECSTR (DEC Soft Terminal Reset) sequences (ESC[!p)
+    # Pyte doesn't support CSI sequences with intermediate characters,
+    # causing the 'p' to leak through as literal text on the screen.
+    # DECSTR resets terminal attributes, but our pyte-based emulation
+    # doesn't fully support these features anyway.
+    filtered = filtered.replace(b'\x1b[!p', b'')
+
+    # Remove extreme cursor position movements (e.g., ESC[32766;32766H)
+    # These appear in the PTY stream and may cause rendering issues with pyte.
+    # Filtering them prevents potential problems without affecting normal operation.
     import re
     # Match ESC[<large_num>;<large_num>H where large_num > 1000
     filtered = re.sub(b'\x1b\\[(\\d{4,});(\\d{4,})H', b'', filtered)
 
-    had_cpr = len(filtered) != original_len
+    had_filter = len(filtered) != original_len
 
-    return filtered, had_cpr
+    return filtered, had_filter
 
 
 def _process_pty_data(data, app, pyte_stream, menu_state, debug_file=None):
@@ -660,10 +671,10 @@ def _process_pty_data(data, app, pyte_stream, menu_state, debug_file=None):
     start_time = time.time()
     _debug_log(debug_file, f"PTY_DATA: Processing {len(data)} bytes (menu_visible={menu_state.is_visible}, app id: {id(app)})")
 
-    # Filter out cursor position queries before processing
-    filtered_data, had_cpr = _filter_cursor_position_queries(data)
-    if had_cpr:
-        _debug_log(debug_file, f"PTY_DATA: Filtered cursor position queries/reports ({len(data)} -> {len(filtered_data)} bytes)")
+    # Filter out escape sequences that pyte can't handle
+    filtered_data, had_filter = _filter_cursor_position_queries(data)
+    if had_filter:
+        _debug_log(debug_file, f"PTY_DATA: Filtered unsupported escape sequences ({len(data)} -> {len(filtered_data)} bytes)")
 
     if not filtered_data:
         _debug_log(debug_file, "PTY_DATA: All data was filtered out, skipping")
