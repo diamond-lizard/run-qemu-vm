@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import fcntl
 import os
 import select
@@ -936,9 +937,60 @@ def _initialize_console_state(debug_file=None):
     return log_queue, log_buffer, current_mode, menu_state, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream
 
 
+def _restore_terminal_state(original_attrs, debug_file=None):
+    """
+    Restores terminal state by selectively re-enabling flags that were disabled
+    by _apply_termios_hardening (ISIG, IEXTEN, IXON, IXOFF).
+
+    This function is idempotent and safe to call multiple times.
+    Errors are logged to debug file only, without raising exceptions or printing to stderr.
+
+    Args:
+        original_attrs: Terminal attributes saved before hardening, or None if hardening was skipped
+        debug_file: Optional debug file handle for logging
+    """
+    if original_attrs is None:
+        _debug_log(debug_file, "TERMIOS_RESTORE: No original attributes to restore (hardening was skipped)")
+        return
+
+    _debug_log(debug_file, "TERMIOS_RESTORE: Starting terminal state restoration")
+    try:
+        # Get current terminal attributes
+        current_attrs = termios.tcgetattr(sys.stdin.fileno())
+
+        # Restore only the specific flags we modified:
+        # Re-enable IXON and IXOFF in iflag (input flags)
+        original_iflag = original_attrs[0]
+        current_iflag = current_attrs[0]
+        restored_iflag = current_iflag | (original_iflag & (termios.IXON | termios.IXOFF))
+
+        # Re-enable ISIG and IEXTEN in lflag (local flags)
+        original_lflag = original_attrs[3]
+        current_lflag = current_attrs[3]
+        restored_lflag = current_lflag | (original_lflag & (termios.ISIG | termios.IEXTEN))
+
+        _debug_log(debug_file, f"TERMIOS_RESTORE: Current - iflag={current_iflag:08x}, lflag={current_lflag:08x}")
+        _debug_log(debug_file, f"TERMIOS_RESTORE: Original - iflag={original_iflag:08x}, lflag={original_lflag:08x}")
+        _debug_log(debug_file, f"TERMIOS_RESTORE: Restored - iflag={restored_iflag:08x}, lflag={restored_lflag:08x}")
+
+        # Apply the restoration
+        current_attrs[0] = restored_iflag
+        current_attrs[3] = restored_lflag
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, current_attrs)
+
+        _debug_log(debug_file, "TERMIOS_RESTORE: Successfully restored terminal state")
+
+    except Exception as e:
+        # Log error silently without printing to stderr or raising
+        _debug_log(debug_file, f"TERMIOS_RESTORE: Error restoring terminal state: {e}")
+        _debug_log(debug_file, f"TERMIOS_RESTORE: Traceback: {traceback.format_exc()}")
+
+
 def _apply_termios_hardening(debug_file=None):
     """
     Applies additional termios hardening on top of prompt_toolkit's raw mode.
+
+    Returns the original terminal attributes before modification so they can be restored later.
 
     This function must be called AFTER the Application is created but BEFORE
     app.run_async() is called. It ensures that control characters like Ctrl-]
@@ -988,10 +1040,13 @@ def _apply_termios_hardening(debug_file=None):
         else:
             _debug_log(debug_file, "TERMIOS_HARDEN: Verification successful - all flags disabled")
 
+        return original_attrs
+
     except Exception as e:
         # Log the error but don't fail - prompt_toolkit's raw mode should still work
         _debug_log(debug_file, f"TERMIOS_HARDEN: Error applying hardening: {e}")
         print(f"Warning: Could not apply additional terminal hardening: {e}", file=sys.stderr)
+        return None
 
 
 def _setup_console_app(
@@ -1062,7 +1117,12 @@ def _setup_console_app(
         style=dialog_style,
     )
     _debug_log(debug_file, f"APP: Console application setup complete (app id: {id(app)})")
-    return app
+
+    # Apply termios hardening AFTER app is created but BEFORE run_async()
+    # This ensures control characters like Ctrl-] are captured by the app
+    original_attrs = _apply_termios_hardening(debug_file)
+
+    return app, original_attrs
 
 
 def _create_async_tasks(app, pty_fd, log_queue, monitor_sock, log_buffer, monitor_pyte_stream, menu_state, current_mode, pty_reader_callback, qemu_output_queue, debug_file=None):
@@ -1107,6 +1167,7 @@ async def _manage_console_session(
     monitor_sock,
     attr_log_file,
     raw_log_file,
+    original_attrs=None,
     debug_file=None,
 ):
     """Runs the application loop, handles errors, and performs cleanup."""
@@ -1125,6 +1186,9 @@ async def _manage_console_session(
             _debug_log(debug_file, "CLEANUP: PTY reader unregistered")
         except Exception:
             pass  # Ignore errors if already removed or loop is closing
+
+        # Restore terminal state after prompt_toolkit cleanup
+        _restore_terminal_state(original_attrs, debug_file)
 
         _cleanup_console(qemu_process, tasks, pty_fd, monitor_sock, attr_log_file, raw_log_file, debug_file)
         return_code = qemu_process.returncode or 0
@@ -1212,7 +1276,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
 
     monitor_sock = await _connect_to_monitor(monitor_socket_path, debug_file)
 
-    app = _setup_console_app(
+    app, original_attrs = _setup_console_app(
         current_mode,
         pty_fd,
         monitor_sock,
@@ -1224,9 +1288,9 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         debug_file,
     )
 
-    # Apply termios hardening AFTER app is created but BEFORE run_async()
-    # This ensures control characters like Ctrl-] are captured by the app
-    _apply_termios_hardening(debug_file)
+    # Register atexit handler to ensure terminal restoration on abnormal exit
+    # This is idempotent and safe to call multiple times
+    atexit.register(_restore_terminal_state, original_attrs, debug_file)
 
     # Create the PTY reader callback. This function will be registered and
     # deregistered from the event loop as needed.
@@ -1253,6 +1317,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         monitor_sock,
         attr_log_file,
         raw_log_file,
+        original_attrs,
         debug_file,
     )
 
