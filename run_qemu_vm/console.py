@@ -35,18 +35,9 @@ from prompt_toolkit.styles import Style
 
 from . import config as app_config
 from .acs_translator import ACSTranslator
-
-
-def _debug_log(debug_file, message):
-    """Writes a timestamped debug message to the debug file if enabled."""
-    if debug_file:
-        try:
-            timestamp = time.time()
-            debug_file.write(f"[{timestamp:.6f}] {message}\n")
-            debug_file.flush()
-        except (ValueError, OSError):
-            # File might be closed if called from atexit, ignore silently
-            pass
+from .enhanced_screen import EnhancedScreen
+from .logging_utils import debug_log as _debug_log
+from .pyte_preprocessor import PytePreprocessor
 
 
 class AnsiColorProcessor(Processor):
@@ -628,56 +619,19 @@ async def _log_task_error(log_queue: Queue, task_name: str, error_type: str = "E
     tb_str = traceback.format_exc()
     await log_queue.put(f"\n--- {task_name} {error_type} ---\n{tb_str}")
 
-
-def _filter_cursor_position_queries(data):
-    """
-    Filters out escape sequences that pyte cannot handle correctly.
-
-    This includes:
-    - Cursor position queries (ESC[6n) which can cause cursor position issues
-    - DECSTR sequences (ESC[!p) which contain intermediate characters that pyte
-      doesn't support, causing the 'p' to leak as literal text
-    - Extreme cursor position movements (ESC[large;largeH) which cause out-of-bounds cursor positioning
-
-    Returns: (filtered_data, had_filter)
-    """
-    original_len = len(data)
-
-    # Remove cursor position queries (ESC[6n)
-    filtered = data.replace(b'\x1b[6n', b'')
-
-    # Remove DECSTR (DEC Soft Terminal Reset) sequences (ESC[!p)
-    # Pyte doesn't support CSI sequences with intermediate characters,
-    # causing the 'p' to leak through as literal text on the screen.
-    # DECSTR resets terminal attributes, but our pyte-based emulation
-    # doesn't fully support these features anyway.
-    filtered = filtered.replace(b'\x1b[!p', b'')
-
-    # Remove extreme cursor position movements (e.g., ESC[32766;32766H)
-    # These appear in the PTY stream and may cause rendering issues with pyte.
-    # Filtering them prevents potential problems without affecting normal operation.
-    import re
-    # Match ESC[<large_num>;<large_num>H where large_num > 1000
-    filtered = re.sub(b'\x1b\\[(\\d{4,});(\\d{4,})H', b'', filtered)
-
-    had_filter = len(filtered) != original_len
-
-    return filtered, had_filter
-
-
-def _process_pty_data(data, app, pyte_stream, acs_translator, menu_state, debug_file=None):
+def _process_pty_data(data, app, pyte_stream, preprocessor, acs_translator, menu_state, debug_file=None):
     """
     Feeds PTY data to the pyte stream and triggers UI invalidation.
 
-    The data flows through: filter -> ACS translate -> decode -> pyte.
+    The data flows through: preprocess -> ACS translate -> decode -> pyte.
     """
     start_time = time.time()
     _debug_log(debug_file, f"PTY_DATA: Processing {len(data)} bytes (menu_visible={menu_state.is_visible}, app id: {id(app)})")
 
-    # Filter out escape sequences that pyte can't handle
-    filtered_data, had_filter = _filter_cursor_position_queries(data)
-    if had_filter:
-        _debug_log(debug_file, f"PTY_DATA: Filtered unsupported escape sequences ({len(data)} -> {len(filtered_data)} bytes)")
+    # Filter CSI sequences with intermediate characters and extreme cursor moves
+    filtered_data = preprocessor.filter(data)
+    if len(filtered_data) != len(data):
+        _debug_log(debug_file, f"PTY_DATA: Preprocessor filtered ({len(data)} -> {len(filtered_data)} bytes)")
 
     if not filtered_data:
         _debug_log(debug_file, "PTY_DATA: All data was filtered out, skipping")
@@ -709,7 +663,7 @@ def _process_pty_data(data, app, pyte_stream, acs_translator, menu_state, debug_
     _debug_log(debug_file, f"PTY_DATA: Total processing time {total_duration:.6f}s")
 
 
-def _create_pty_reader_callback(app, pty_fd, pyte_stream, acs_translator, menu_state, raw_log_file, debug_file=None):
+def _create_pty_reader_callback(app, pty_fd, pyte_stream, preprocessor, acs_translator, menu_state, raw_log_file, debug_file=None):
     """
     Creates a callback function for the asyncio event loop to handle PTY data.
 
@@ -747,7 +701,7 @@ def _create_pty_reader_callback(app, pty_fd, pyte_stream, acs_translator, menu_s
                     pass  # Ignore errors if the file is closed or invalid
 
             # Process the data for display
-            _process_pty_data(data, app, pyte_stream, acs_translator, menu_state, debug_file)
+            _process_pty_data(data, app, pyte_stream, preprocessor, acs_translator, menu_state, debug_file)
 
         except BlockingIOError:
             # This can happen if we read when there's no data. It's not an error.
@@ -951,8 +905,12 @@ def _initialize_console_state(debug_file=None):
 
     _debug_log(debug_file, f"INIT: Creating pyte screen with cols={cols}, rows={rows}")
 
-    pyte_screen = pyte.Screen(cols, rows)
+    # Use EnhancedScreen for serial console to enable PTY response capability
+    # (e.g., cursor position responses to ESC[6n queries)
+    pyte_screen = EnhancedScreen(cols, rows)
     pyte_stream = pyte.Stream(pyte_screen)
+
+    # Plain pyte.Screen for monitor (no PTY responses needed)
     monitor_pyte_screen = pyte.Screen(cols, rows)
     monitor_pyte_stream = pyte.Stream(monitor_pyte_screen)
 
@@ -960,7 +918,11 @@ def _initialize_console_state(debug_file=None):
     # Only used for PTY (serial console), not for monitor.
     acs_translator = ACSTranslator()
 
-    return log_queue, log_buffer, current_mode, menu_state, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream, acs_translator
+    # Preprocessor for filtering CSI sequences with intermediate characters
+    # and extreme cursor positions. Needs screen reference for dimensions.
+    preprocessor = PytePreprocessor(pyte_screen, debug_file)
+
+    return log_queue, log_buffer, current_mode, menu_state, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream, acs_translator, preprocessor
 
 
 def _restore_terminal_state(original_attrs, debug_file=None):
@@ -1261,6 +1223,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         monitor_pyte_screen,
         monitor_pyte_stream,
         acs_translator,
+        preprocessor,
     ) = _initialize_console_state(debug_file)
 
     attr_log_file = None
@@ -1304,6 +1267,9 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
     # This ensures the guest OS (e.g., GRUB, Linux) formats its output correctly from boot.
     _set_pty_size(pty_fd, pyte_screen.lines, pyte_screen.columns, debug_file)
 
+    # Wire up the PTY fd to the enhanced screen for response capability
+    pyte_screen.set_pty_fd(pty_fd)
+
     monitor_sock = await _connect_to_monitor(monitor_socket_path, debug_file)
 
     app, original_attrs = _setup_console_app(
@@ -1325,7 +1291,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
     # Create the PTY reader callback. This function will be registered and
     # deregistered from the event loop as needed.
     pty_reader_callback = _create_pty_reader_callback(
-        app, pty_fd, pyte_stream, acs_translator, menu_state, raw_log_file, debug_file
+        app, pty_fd, pyte_stream, preprocessor, acs_translator, menu_state, raw_log_file, debug_file
     )
 
     tasks = _create_async_tasks(
