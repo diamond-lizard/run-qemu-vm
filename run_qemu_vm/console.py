@@ -34,6 +34,7 @@ from prompt_toolkit.layout.processors import (
 from prompt_toolkit.styles import Style
 
 from . import config as app_config
+from .acs_translator import ACSTranslator
 
 
 def _debug_log(debug_file, message):
@@ -664,9 +665,11 @@ def _filter_cursor_position_queries(data):
     return filtered, had_filter
 
 
-def _process_pty_data(data, app, pyte_stream, menu_state, debug_file=None):
+def _process_pty_data(data, app, pyte_stream, acs_translator, menu_state, debug_file=None):
     """
     Feeds PTY data to the pyte stream and triggers UI invalidation.
+
+    The data flows through: filter -> ACS translate -> decode -> pyte.
     """
     start_time = time.time()
     _debug_log(debug_file, f"PTY_DATA: Processing {len(data)} bytes (menu_visible={menu_state.is_visible}, app id: {id(app)})")
@@ -680,7 +683,11 @@ def _process_pty_data(data, app, pyte_stream, menu_state, debug_file=None):
         _debug_log(debug_file, "PTY_DATA: All data was filtered out, skipping")
         return
 
-    decoded_data = filtered_data.decode("utf-8", "replace")
+    # Translate DEC Special Graphics (ACS) to Unicode box-drawing characters.
+    # This must happen before UTF-8 decode since the translator works on bytes.
+    translated_data = acs_translator.translate(filtered_data)
+
+    decoded_data = translated_data.decode("utf-8", "replace")
 
     # Log a sample of the data for debugging
     sample = decoded_data[:100].replace('\n', '\\n').replace('\r', '\\r')
@@ -702,7 +709,7 @@ def _process_pty_data(data, app, pyte_stream, menu_state, debug_file=None):
     _debug_log(debug_file, f"PTY_DATA: Total processing time {total_duration:.6f}s")
 
 
-def _create_pty_reader_callback(app, pty_fd, pyte_stream, menu_state, raw_log_file, debug_file=None):
+def _create_pty_reader_callback(app, pty_fd, pyte_stream, acs_translator, menu_state, raw_log_file, debug_file=None):
     """
     Creates a callback function for the asyncio event loop to handle PTY data.
 
@@ -740,7 +747,7 @@ def _create_pty_reader_callback(app, pty_fd, pyte_stream, menu_state, raw_log_fi
                     pass  # Ignore errors if the file is closed or invalid
 
             # Process the data for display
-            _process_pty_data(data, app, pyte_stream, menu_state, debug_file)
+            _process_pty_data(data, app, pyte_stream, acs_translator, menu_state, debug_file)
 
         except BlockingIOError:
             # This can happen if we read when there's no data. It's not an error.
@@ -949,7 +956,11 @@ def _initialize_console_state(debug_file=None):
     monitor_pyte_screen = pyte.Screen(cols, rows)
     monitor_pyte_stream = pyte.Stream(monitor_pyte_screen)
 
-    return log_queue, log_buffer, current_mode, menu_state, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream
+    # ACS translator for converting DEC Special Graphics to Unicode.
+    # Only used for PTY (serial console), not for monitor.
+    acs_translator = ACSTranslator()
+
+    return log_queue, log_buffer, current_mode, menu_state, pyte_screen, pyte_stream, monitor_pyte_screen, monitor_pyte_stream, acs_translator
 
 
 def _restore_terminal_state(original_attrs, debug_file=None):
@@ -1249,6 +1260,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
         pyte_stream,
         monitor_pyte_screen,
         monitor_pyte_stream,
+        acs_translator,
     ) = _initialize_console_state(debug_file)
 
     attr_log_file = None
@@ -1313,7 +1325,7 @@ async def run_prompt_toolkit_console(qemu_process, pty_device, monitor_socket_pa
     # Create the PTY reader callback. This function will be registered and
     # deregistered from the event loop as needed.
     pty_reader_callback = _create_pty_reader_callback(
-        app, pty_fd, pyte_stream, menu_state, raw_log_file, debug_file
+        app, pty_fd, pyte_stream, acs_translator, menu_state, raw_log_file, debug_file
     )
 
     tasks = _create_async_tasks(
