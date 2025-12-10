@@ -1,0 +1,14 @@
+[project]
+name = "run-qemu-vm"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "prompt-toolkit>=3.0.52",
+    "pyte>=0.8.2",
+]
+
+[dependency-groups]
+dev = [
+    "manhole>=1.8.1",
+    "pytest>=9.0.1",
+]
